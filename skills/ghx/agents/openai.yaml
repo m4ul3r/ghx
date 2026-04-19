@@ -1,0 +1,4 @@
+interface:
+  display_name: "ghx"
+  short_description: "Use ghx for Ghidra reversing tasks"
+  default_prompt: "Use $ghx to do Ghidra reversing work through the local ghx CLI."
