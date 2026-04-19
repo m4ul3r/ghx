@@ -28,9 +28,3 @@ htmlcov/
 
 # ghx runtime output
 *.log
-
-# Challenge-binary build products (sources + Makefile ARE tracked)
-tmp/*
-!tmp/*.c
-!tmp/Makefile
-!tmp/.gitignore
