@@ -70,18 +70,31 @@ mapping, don't fake the feature.
 Matching command names + flags is the easy 80% and was mostly already built.
 **Real parity = bn and ghx return semantically equivalent ANSWERS on the same
 binary.** A command can have identical `--help` and still disagree. Proven by an
-A/B run on `fw-A/bin-1` (2026-06-17, see ledger):
+A/B run on `fw-A/bin-1` (2026-06-17, see ledger).
 
-| metric | bn | ghx | status |
+Baseline (first run) — every probe diverged:
+
+| metric | bn | ghx (before) | root cause |
 |---|---|---|---|
-| functions | 51 | 79 | **DIVERGES** — ghx likely counts thunks/auto-stubs bn omits |
-| imports | 59 | 84 | **DIVERGES** — ghx counts 28 externals + 56 thunks as rows |
-| strings | 104 | 125 | **DIVERGES** — different defined-string heuristics |
-| sections | 25 | 28 | **DIVERGES** — memory-block vs section modeling |
-| decompile 0x400f20 | 216 lines, `uint64_t` ret | 139 lines, `void` ret | engine difference |
+| functions | 51 | 79 | ghx listed 28 synthetic EXTERNAL-block import thunks |
+| imports (by name) | 28 | 28 | (already agreed — the 59/84 raw gap was thunk-row inflation) |
+| strings | 104 | 125 | ghx scanned ELF metadata blocks (.shstrtab/debuglink/sec-hdrs) |
+| sections | 25 | 28 | memory-block vs section modeling |
 
-Every "[x]" below means the **surface** matches. It does NOT mean the answer
-matches bn. Re-grade against this A/B bar.
+After this cycle — three probes reconciled:
+
+| metric | bn | ghx (after) | status |
+|---|---|---|---|
+| functions | 51 | 51 | **AGREE on count**; sets differ by 1 each way — both are single-instruction CRT/padding stubs (a lone `ret` / `nop`); bidirectional engine heuristic, documented |
+| imports (by name) | 28 | 28 | **AGREE** |
+| strings | 104 | 100 | metadata noise removed (ghx-only 27→2); residual ghx-only 2 = ELF-header/`.note` bytes, residual bn-only 6 = strings Ghidra never defined (analysis gap) |
+| sections | 25 | 28 | DIVERGES — synthetic-block naming (`EXTERNAL`/`.shstrtab` vs `.extern`/`.synthetic_builtins`); **documented engine difference** |
+| xrefs (callers, 28 import seeds) | 95 | 95 | **AGREE** on code-ref callers (26/28 seeds exact); the 2 residuals are CRT-startup glue; ghx additionally surfaces 29 GOT/PLT data-slot relocations (bn buckets these as `data_ref_count`) |
+| decompile | 216 lines | 139 lines | engine difference (naming/types/line count) — DOCUMENT, verify logic not bytes |
+
+Every "[x]" below means the **surface** matches. A "[x]" in P0(real) additionally
+means the *answer* agrees with bn (or the divergence is a documented engine
+difference). Re-grade against this A/B bar.
 
 ## Status snapshot (2026-06-17)
 
@@ -89,9 +102,15 @@ matches bn. Re-grade against this A/B bar.
   in `ghx` except `plugin` (GUI extension — out of scope). Option-level gaps,
   friction-log signal issues, and P2 surface are closed (see ledger).
 - **Out-of-box auto-spawn: FIXED** (`/tmp/ghx-projects/<id>`).
-- **Semantic parity: NOT ESTABLISHED.** No command's answer has been verified to
-  match bn's. The A/B table above shows material divergence on the most basic
-  queries. This — plus dataflow depth — is the real remaining work.
+- **Semantic parity: ESTABLISHED for the basic queries (cycle 1).** A/B-verified
+  agreement now holds for `imports`, `functions` (count, after hiding EXTERNAL-block
+  thunks), `strings` (after dropping metadata-block noise), and `xrefs` callers
+  (26/28 import seeds exact). Remaining divergences are documented engine
+  differences (`sections` block naming, `decompile` naming/types/line-count, a
+  handful of bidirectional single-instruction-stub / CRT-glue / string-analysis
+  gaps). The real remaining work is **dataflow depth** (taint out-buffer source,
+  interprocedural trace/taint) and **running the harness on a corpus**, not just
+  one 13KB binary.
 
 ## P0(real) — semantic reconciliation (the actual parity work)
 
@@ -101,36 +120,57 @@ unproven regardless of how many flags match.
 - [x] **A/B harness** — `tools/ab_parity.py <binary>`. Starts an isolated bn
   instance (never touches the ~20 sensitive ones), loads the same binary in both,
   and diffs address/name sets per command (addresses are ground truth). First run
-  on `fw-A/bin-1` root-caused every divergence below.
+  on `fw-A/bin-1` root-caused every divergence below. Now covers 5 probes:
+  list-style (functions/imports/strings/sections) plus a **seeded** `xrefs` probe
+  that, per shared import name, diffs the caller-address set (splitting code refs
+  from GOT/PLT data slots). `--probe NAME` runs a subset.
 
 Root-caused divergences (from the 2026-06-17 A/B run — each is now a concrete fix
 or a documented engine difference):
-- [ ] **functions (bn 51 / ghx 79).** TWO opposing effects: (a) ghx OVER-counts —
-  ~28 of the extras are synthetic thunks in Ghidra's `EXTERNAL` block at 0x414xxx
-  (`is_thunk=true`, size 1) plus a couple tiny `FUN_` stubs; bn doesn't call these
-  functions. (b) ghx UNDER-detects — bn found a real function at 0x401d40 that
-  Ghidra's auto-analysis missed entirely (`function info 0x401d40` → not_found).
-  Fix: give `function list` a way to exclude EXTERNAL-block thunks (match bn's
-  notion), and investigate the missed-function gap (analysis options / `function
-  create`).
-- [ ] **imports (bn 30 / ghx 28 by name).** ghx enumerates external *function*
-  symbols + thunks only; it MISSES imported DATA symbols (`stderr`,
-  `__stack_chk_guard`). Fix: include imported data/object symbols in `imports`.
-  (The raw 84-vs-59 count gap is just thunk-row inflation on both sides; compare
-  by unique name.)
-- [ ] **strings (bn 104 / ghx 125).** ghx includes ELF METADATA-section strings as
-  noise (the near-0x0 addresses are in `.shstrtab` / `.gnu_debuglink`); bn scans
-  only loaded segments. Conversely bn found 6 real strings in `0x40xxxx` that
-  Ghidra didn't define. Fix: default `strings` to loaded/initialized memory
-  (exclude `.shstrtab`/debug/section-header blocks); note the heuristic gap.
-- [ ] **sections (bn 25 / ghx 28).** Mostly synthetic-section modeling differences
-  (ghx exposes `EXTERNAL`, `_elfSectionHeaders`, `.shstrtab`; bn exposes
-  `.extern`, `.synthetic_builtins`, `.dynamic_rela`). Likely DOCUMENT, but
-  consider hiding pure ELF-metadata blocks from the default `sections` view.
+- [x] **functions (bn 51 / ghx 79 → 51).** ghx over-counted 28 synthetic thunks in
+  Ghidra's `EXTERNAL` block (`is_thunk=true`, size 1). FIXED: `function
+  list/search` now hide EXTERNAL-block entries by default (matching bn's notion);
+  `--include-externals` restores the full Ghidra view. Filter is by memory-block
+  name so the 29 *real* `.plt` thunks bn also lists are kept. Residual set diff is
+  1 each way — bn made a function at a lone `ret` Ghidra left as an undefined byte;
+  ghx wrapped a lone `nop` in a `FUN_` bn ignored. Both are single-instruction
+  CRT/padding stubs — a bidirectional engine heuristic, DOCUMENTED, not a bug.
+- [x] **imports (bn 28 / ghx 28 by name).** AGREE in a clean A/B. The earlier
+  `bn=30` (with `stderr`/`__stack_chk_guard`) did NOT reproduce in a freshly-loaded
+  isolated bn instance — it was an analysis-timing/state artifact of the prior bn
+  process, not a ghx gap. Lesson: A/B both engines from a clean load. (The raw
+  84-vs-59 count gap was always just thunk-row inflation; compare by unique name.)
+- [x] **strings (bn 104 / ghx 125 → 100).** ghx scanned ELF METADATA blocks
+  (`.shstrtab`/`.gnu_debuglink`/`_elfSectionHeaders` — overlay spaces where
+  `isLoaded()==False`). FIXED: `strings` defaults to the loaded image only;
+  `--include-metadata` (or an explicit `--section`) restores them. ghx-only noise
+  27→2. Residual: 2 ghx-only (ELF-header/`.note.ABI-tag` bytes in loaded segments,
+  borderline) + 6 bn-only (real strings Ghidra's analyzer never defined — an
+  analysis-depth gap; would need extra string detection to close). DOCUMENTED.
+- [~] **sections (bn 25 / ghx 28).** Synthetic-block naming differs (ghx exposes
+  `EXTERNAL`, `_elfSectionHeaders`, `.shstrtab`, `.note.ABI-tag`, `segment_2.1`; bn
+  exposes `.extern`, `.synthetic_builtins`, `.dynamic_rela`). This is how each
+  engine *names* the same underlying layout — a DOCUMENTED engine difference. An
+  agent gets equivalent structural info either way. NOT filtering: `sections` is a
+  structural view where completeness beats noise-reduction (unlike `strings`).
+- [x] **xrefs (callers).** Harness extended to seed per shared import and diff
+  caller-address sets. Result: 26/28 seeds AGREE exactly on code-ref callers
+  (bn=95 / ghx=95 shared). The harness ALSO surfaced + we fixed a real bug:
+  `xrefs <name>` raised `ambiguous_function` when a libc name matched both the
+  `.plt` thunk and the `EXTERNAL` stub — it now unions refs across both (mirroring
+  `callsites`, matching `bn xrefs <name>`), reporting `matched_targets`. ghx still
+  surfaces GOT/PLT *data*-slot relocations bn omits from its caller list (bn keeps
+  a separate `data_ref_count`); the harness buckets those as a note, not a
+  disagreement. The 2 residual code-ref diffs are CRT-startup glue (a `bl abort`
+  from `entry`; a `__gmon_start__` GOT pointer-load) — DOCUMENTED.
+  NB: bn `callsites` REQUIRES a scope (`--within`/`--within-file`); its
+  whole-program "callers of X" is `bn xrefs <name>`. ghx `callsites <name>` is
+  whole-program by default — both reach the same answer, mapped via xrefs here.
 - [ ] **decompiler/types.** Naming (`sub_` vs `FUN_`), inferred return types
   (`uint64_t` vs `void`), line counts (216 vs 139) differ — engine difference.
   Verify the same *logic* is recovered, document rather than force byte-equality.
-- [ ] **Run on a corpus, not one 13KB binary.** Multiple arches/sizes.
+- [ ] **Run on a corpus, not one 13KB binary.** Multiple arches/sizes. The harness
+  is generic (`tools/ab_parity.py <binary>`); only the dogfood target has been run.
 
 ## Backlog (prioritized, grounded in the dogfood friction log + option diff)
 
@@ -328,6 +368,23 @@ already loaded speeds the loop. Keep all captured artifacts under `.dogfood/`.
 
 ## Progress ledger (append one line per cycle — newest first)
 
+- 2026-06-17 — **Semantic reconciliation, cycle 1 (fix against the A/B bar).**
+  Drove 3 of 4 structural probes to AGREEMENT and extended the harness:
+  (1) `function list/search` hide EXTERNAL-block synthetic thunks by default
+  (`--include-externals` opts in) — functions 79→51, matches bn's 51; residual
+  1-each-way is single-instruction CRT/padding stubs (documented).
+  (2) `strings` defaults to the loaded image (`--include-metadata` opts in) —
+  ghx-only noise 27→2; residual 6 bn-only is a Ghidra string-analysis gap.
+  (3) imports confirmed AGREE in a clean A/B (earlier bn=30 was an analysis-timing
+  artifact, not a ghx bug).
+  (4) Extended `ab_parity.py` with a seeded `xrefs` probe (per shared import, diff
+  caller-address sets, code-refs vs GOT/PLT data slots) → 26/28 seeds AGREE on
+  callers. The probe surfaced a real bug: `xrefs <name>` raised
+  `ambiguous_function` for libc names matching a `.plt` thunk + `EXTERNAL` stub;
+  FIXED to union refs (mirrors `callsites`, matches `bn xrefs`), emits
+  `matched_targets`. sections + decompile remain documented engine differences.
+  179 unit green; +5 new parser cases; +3 new integration tests (function/strings
+  default-filter, xrefs union) all green; full integration suite (17) green.
 - 2026-06-17 — Built `tools/ab_parity.py` and root-caused all 4 structural
   divergences via address-set diffs: functions = ghx over-counts EXTERNAL thunks
   + misses 0x401d40 that bn found; imports = ghx misses data symbols (stderr,

@@ -646,6 +646,129 @@ def test_callsites_libc_name_not_ambiguous(running_agent):
     assert ok_any, "no callsites resolved for any imported name"
 
 
+def test_xrefs_by_name_unions_thunks(running_agent):
+    """A libc name resolves to BOTH a .plt thunk and the EXTERNAL stub; xrefs by
+    name must union their references (like callsites, and like `bn xrefs`)
+    instead of raising ambiguous_function."""
+    load = send_request(
+        "load_binary", params={"path": "/bin/true"},
+        instance_id=running_agent, timeout=120.0,
+    )
+    program_id = load["result"]["program_id"]
+
+    imports = send_request(
+        "imports", target=program_id, instance_id=running_agent,
+    )["result"]
+    # A name that appears as both an external symbol and a thunk is the
+    # ambiguous case that used to error.
+    by_name: dict[str, set] = {}
+    for r in imports:
+        by_name.setdefault(r["name"], set()).add(bool(r.get("is_thunk")))
+    ambiguous = [n for n, kinds in by_name.items() if kinds == {True, False}]
+
+    checked = 0
+    for name in (ambiguous or [r["name"] for r in imports])[:10]:
+        resp = send_request(
+            "xrefs", params={"identifier": name},
+            target=program_id, instance_id=running_agent,
+        )
+        assert resp["ok"] is True, f"xrefs {name} errored: {resp}"
+        assert "incoming" in resp["result"]
+        checked += 1
+    assert checked, "no import names to exercise xrefs-by-name"
+
+
+def test_function_list_hides_external_block_by_default(running_agent):
+    """bn omits Ghidra's synthetic EXTERNAL-block import thunks from the function
+    list; ghx must match by default and expose them only via --include-externals."""
+    load = send_request(
+        "load_binary", params={"path": "/bin/true"},
+        instance_id=running_agent, timeout=120.0,
+    )
+    program_id = load["result"]["program_id"]
+
+    default = send_request(
+        "list_functions", params={"limit": 100000},
+        target=program_id, instance_id=running_agent,
+    )["result"]
+    with_ext = send_request(
+        "list_functions", params={"limit": 100000, "include_externals": True},
+        target=program_id, instance_id=running_agent,
+    )["result"]
+
+    default_addrs = {r["address"] for r in default}
+    ext_addrs = {r["address"] for r in with_ext}
+    # Default is always a subset of the full Ghidra view.
+    assert default_addrs <= ext_addrs
+    # The EXTERNAL block lives at the top of the address space; every function
+    # the flag adds back must sit in a block named EXTERNAL, and none may leak
+    # into the default list.
+    added = ext_addrs - default_addrs
+    blocks = send_request(
+        "py_exec",
+        params={"code": (
+            "mem = currentProgram.getMemory()\n"
+            "af = currentProgram.getAddressFactory()\n"
+            "result = {a: (lambda b: b.getName() if b else None)("
+            "mem.getBlock(af.getAddress(a))) for a in " + repr(sorted(added)) + "}"
+        )},
+        target=program_id, instance_id=running_agent,
+    )["result"]["result"]
+    if added:
+        assert all(name == "EXTERNAL" for name in blocks.values()), blocks
+    # Inversely, no default function may be an EXTERNAL-block entry.
+    default_blocks = send_request(
+        "py_exec",
+        params={"code": (
+            "mem = currentProgram.getMemory()\n"
+            "af = currentProgram.getAddressFactory()\n"
+            "result = [a for a in " + repr(sorted(default_addrs)) + " "
+            "if (lambda b: b and b.getName() == 'EXTERNAL')("
+            "mem.getBlock(af.getAddress(a)))]"
+        )},
+        target=program_id, instance_id=running_agent,
+    )["result"]["result"]
+    assert default_blocks == [], default_blocks
+
+
+def test_strings_excludes_metadata_blocks_by_default(running_agent):
+    """ELF metadata blocks (.shstrtab/.gnu_debuglink/section headers) live in
+    non-loaded overlay spaces; bn never reports strings there, so ghx hides them
+    unless --include-metadata (or an explicit --section) is given."""
+    load = send_request(
+        "load_binary", params={"path": "/bin/true"},
+        instance_id=running_agent, timeout=120.0,
+    )
+    program_id = load["result"]["program_id"]
+
+    default = send_request(
+        "strings", params={"limit": 100000},
+        target=program_id, instance_id=running_agent,
+    )["result"]
+    with_meta = send_request(
+        "strings", params={"limit": 100000, "include_metadata": True},
+        target=program_id, instance_id=running_agent,
+    )["result"]
+
+    def key(rows):
+        return {(r.get("section"), r["address"], r["value"]) for r in rows}
+
+    assert key(default) <= key(with_meta)
+    # Every string the default view drops must come from a non-loaded block.
+    dropped_sections = {sec for (sec, _a, _v) in key(with_meta) - key(default)}
+    if dropped_sections:
+        loaded = send_request(
+            "py_exec",
+            params={"code": (
+                "mem = currentProgram.getMemory()\n"
+                "result = {b.getName(): bool(b.isLoaded()) for b in mem.getBlocks()}"
+            )},
+            target=program_id, instance_id=running_agent,
+        )["result"]["result"]
+        for sec in dropped_sections:
+            assert loaded.get(sec) is False, (sec, loaded)
+
+
 def test_py_exec_read_only(running_agent):
     send_request(
         "load_binary",

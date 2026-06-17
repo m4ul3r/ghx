@@ -741,6 +741,7 @@ class GhxBridge:
         limit = int(params["limit"]) if params.get("limit") is not None else None
         lo_s = params.get("min_address")
         hi_s = params.get("max_address")
+        include_externals = bool(params.get("include_externals"))
         program = handle.program
 
         lo = _parse_address(program, lo_s) if lo_s is not None else None
@@ -755,6 +756,8 @@ class GhxBridge:
             if lo is not None and off < lo:
                 continue
             if hi is not None and off > hi:
+                continue
+            if not include_externals and _in_external_block(program, entry):
                 continue
             items.append(_func_brief(fn))
         _sort_func_rows(items, str(params.get("sort") or "address"))
@@ -774,6 +777,7 @@ class GhxBridge:
         exact = bool(params.get("exact", False))
         offset = int(params.get("offset", 0))
         limit = int(params["limit"]) if params.get("limit") is not None else None
+        include_externals = bool(params.get("include_externals"))
         program = handle.program
 
         lo_s = params.get("min_address")
@@ -805,10 +809,13 @@ class GhxBridge:
             name = str(fn.getName())
             if not matches(name):
                 continue
-            off = int(fn.getEntryPoint().getOffset())
+            entry = fn.getEntryPoint()
+            off = int(entry.getOffset())
             if lo is not None and off < lo:
                 continue
             if hi is not None and off > hi:
+                continue
+            if not include_externals and _in_external_block(program, entry):
                 continue
             items.append(_func_brief(fn))
         _sort_func_rows(items, str(params.get("sort") or "address"))
@@ -1108,43 +1115,74 @@ class GhxBridge:
         limit = int(params["limit"]) if params.get("limit") is not None else None
         program = handle.program
 
-        try:
-            off = _parse_address(program, identifier)
-        except Exception:
-            fn = _resolve_function(program, str(identifier))
-            off = int(fn.getEntryPoint().getOffset())
-        addr = program.getAddressFactory().getDefaultAddressSpace().getAddress(off)
-
         fm = program.getFunctionManager()
         rm = program.getReferenceManager()
         listing = program.getListing()
 
+        # Resolve the identifier to one or more target addresses. A raw address
+        # is a single target. A symbol NAME may match several functions (a .plt
+        # thunk AND its EXTERNAL stub) — union references across all of them
+        # instead of raising ambiguous_function, mirroring `_op_callsites` (and
+        # matching `bn xrefs <name>`, which lists callers without complaint).
+        matched_entries: set[int] = set()
+        matched_fns: list[Any] = []
+        try:
+            off = _parse_address(program, identifier)
+            target_addrs = [
+                program.getAddressFactory().getDefaultAddressSpace().getAddress(off)
+            ]
+        except Exception:
+            matched_fns = _resolve_functions(program, str(identifier))
+            if not matched_fns:
+                raise OperationFailure(
+                    "not_found", f"no function matches identifier: {identifier!r}"
+                )
+            target_addrs = [fn.getEntryPoint() for fn in matched_fns]
+            matched_entries = {int(a.getOffset()) for a in target_addrs}
+            off = int(target_addrs[0].getOffset())
+
         code_refs: list[dict[str, Any]] = []
-        for ref in rm.getReferencesTo(addr):
-            from_addr = ref.getFromAddress()
-            from_off = int(from_addr.getOffset())
-            caller = fm.getFunctionContaining(from_addr)
-            ref_type = ref.getReferenceType()
-            ins = listing.getInstructionAt(from_addr)
-            code_refs.append(
-                {
-                    "address": f"0x{from_off:x}",
-                    "function": str(caller.getName()) if caller is not None else None,
-                    "ref_type": str(ref_type),
-                    "is_call": bool(ref_type.isCall()),
-                    "disasm": str(ins) if ins is not None else None,
-                }
-            )
+        seen_from: set[int] = set()
+        for addr in target_addrs:
+            for ref in rm.getReferencesTo(addr):
+                from_addr = ref.getFromAddress()
+                from_off = int(from_addr.getOffset())
+                if from_off in seen_from:
+                    continue
+                caller = fm.getFunctionContaining(from_addr)
+                # Drop a matched thunk's own trampoline branch to its EXTERNAL
+                # stub (the caller is itself one of the unioned targets).
+                if (matched_entries and caller is not None
+                        and int(caller.getEntryPoint().getOffset()) in matched_entries):
+                    continue
+                seen_from.add(from_off)
+                ref_type = ref.getReferenceType()
+                ins = listing.getInstructionAt(from_addr)
+                code_refs.append(
+                    {
+                        "address": f"0x{from_off:x}",
+                        "function": str(caller.getName()) if caller is not None else None,
+                        "ref_type": str(ref_type),
+                        "is_call": bool(ref_type.isCall()),
+                        "disasm": str(ins) if ins is not None else None,
+                    }
+                )
 
         outgoing: list[dict[str, Any]] = []
-        for ref in rm.getReferencesFrom(addr):
-            to = ref.getToAddress()
-            outgoing.append(
-                {
-                    "address": f"0x{int(to.getOffset()):x}",
-                    "ref_type": str(ref.getReferenceType()),
-                }
-            )
+        seen_out: set[tuple[int, str]] = set()
+        for addr in target_addrs:
+            for ref in rm.getReferencesFrom(addr):
+                to = ref.getToAddress()
+                key = (int(to.getOffset()), str(ref.getReferenceType()))
+                if key in seen_out:
+                    continue
+                seen_out.add(key)
+                outgoing.append(
+                    {
+                        "address": f"0x{int(to.getOffset()):x}",
+                        "ref_type": str(ref.getReferenceType()),
+                    }
+                )
 
         code_refs.sort(key=lambda r: int(r["address"], 16))
         incoming_total = len(code_refs)
@@ -1152,12 +1190,16 @@ class GhxBridge:
         if limit is not None:
             paged = paged[:limit]
 
-        return {
+        result: dict[str, Any] = {
             "target": f"0x{off:x}",
             "incoming": paged,
             "incoming_total": incoming_total,
             "outgoing": outgoing,
         }
+        if len(matched_fns) > 1:
+            # The name matched several thunks/symbols whose refs we unioned.
+            result["matched_targets"] = [_func_brief(c) for c in matched_fns]
+        return result
 
     def _op_strings(self, params: dict[str, Any], target: str | None):
         from ghidra.program.util import DefinedStringIterator  # type: ignore
@@ -1178,6 +1220,7 @@ class GhxBridge:
                 needle = str(query).lower()
         section_filter = params.get("section")
         section_needle = str(section_filter) if section_filter else None
+        include_metadata = bool(params.get("include_metadata"))
         min_len = int(params.get("min_length", 1))
         offset = int(params.get("offset", 0))
         limit = int(params["limit"]) if params.get("limit") is not None else None
@@ -1208,6 +1251,13 @@ class GhxBridge:
             off = int(addr.getOffset())
             block = memory.getBlock(addr)
             section = str(block.getName()) if block is not None else None
+            # Default to the loaded image only. The ELF loader adds file-only
+            # metadata blocks (.shstrtab, .gnu_debuglink, _elfSectionHeaders) in
+            # overlay spaces where isLoaded() is False; bn never reports strings
+            # there. An explicit --section names a block, so honor it regardless.
+            if (not include_metadata and section_needle is None
+                    and block is not None and not block.isLoaded()):
+                continue
             if section_needle and section != section_needle:
                 continue
             rows.append(
@@ -3529,6 +3579,19 @@ def _parse_address(program: Any, value: Any) -> int:
     if addr is None:
         raise OperationFailure("bad_address", f"could not parse address: {value!r}")
     return int(addr.getOffset())
+
+
+# Ghidra's synthetic memory block holding external-linkage trampolines — the
+# size-1 `is_thunk` stubs (memcpy, strtok, …) the ELF/PE loader manufactures so
+# the disassembler has a branch target for imports. bn does not model these as
+# functions, so `function list/search` hide them by default (parity).
+_EXTERNAL_BLOCK_NAME = "EXTERNAL"
+
+
+def _in_external_block(program: Any, entry: Any) -> bool:
+    """True if `entry` lies in Ghidra's synthetic EXTERNAL block."""
+    block = program.getMemory().getBlock(entry)
+    return block is not None and str(block.getName()) == _EXTERNAL_BLOCK_NAME
 
 
 def _func_brief(fn: Any) -> dict[str, Any]:

@@ -129,10 +129,119 @@ def _fmt_keys(keys: set, key: str, n: int = 25) -> str:
     return head + more
 
 
+def _bn_argv(args: list[str], bn_inst: str) -> list[str]:
+    return ["bn", *args, "--instance", bn_inst]
+
+
+def _ghx_argv(args: list[str], ghx_inst: str | None) -> list[str]:
+    argv = ["python", "-m", "ghx", *args]
+    if ghx_inst:
+        argv += ["--instance", ghx_inst]
+    return argv
+
+
+# ---- seeded probes -------------------------------------------------------
+# The list probes above need no target. xrefs/callers do: you ask "who
+# references X". bn's whole-program "callers of X" is `bn xrefs <name>`; ghx's
+# is `ghx xrefs <name>` (or `callsites <name>`). We seed with the imported names
+# both engines agree on, then diff the inbound-reference address set per seed —
+# addresses are ground truth, so per-seed set equality is real agreement.
+
+def _shared_import_names(bn_inst: str, ghx_inst: str | None, cap: int = 30) -> list[str]:
+    bn_d = _run_json(_bn_argv(["imports", "--limit", "100000"], bn_inst))
+    ghx_d = _run_json(_ghx_argv(["imports", "--limit", "100000"], ghx_inst))
+
+    def names(data):
+        return {
+            str(r["name"]) for r in _items(data, "imports")
+            if isinstance(r, dict) and r.get("name")
+        }
+
+    return sorted(names(bn_d) & names(ghx_d))[:cap]
+
+
+def _xrefs_addrs(data: object, is_ghx: bool) -> tuple[set, int] | None:
+    """(code-reference address set, data-reference count) from one engine's
+    xrefs JSON. ghx nests rows under `incoming`, bn under `items`; both carry a
+    per-row `address`. We split code from data because "who calls X" is a
+    code-reference question — ghx additionally surfaces the GOT/PLT relocation
+    slot as a DATA ref, which bn buckets into its own `data_ref_count`; counting
+    those as disagreement would be misleading."""
+    if not isinstance(data, dict) or data.get("_error"):
+        return None
+    rows = data.get("incoming") if is_ghx else data.get("items")
+    if not isinstance(rows, list):
+        return set(), 0
+    code, data_refs = set(), 0
+    for r in rows:
+        if not isinstance(r, dict) or r.get("address") is None:
+            continue
+        if is_ghx:
+            is_code = bool(r.get("is_call")) or r.get("function") is not None
+        else:
+            is_code = str(r.get("kind", "code")) == "code"
+        if not is_code:
+            data_refs += 1
+            continue
+        a = _norm_addr(r.get("address"))
+        if a is not None:
+            code.add(a)
+    return code, data_refs
+
+
+def run_xrefs(bn_inst: str, ghx_inst: str | None) -> int:
+    seeds = _shared_import_names(bn_inst, ghx_inst)
+    if not seeds:
+        print("## xrefs: SKIP — no shared import seeds to compare\n")
+        return 0
+    agree = 0
+    diverged: list[tuple] = []
+    bn_total = ghx_total = shared_total = 0
+    bn_data_refs = ghx_data_refs = 0
+    for name in seeds:
+        bn = _xrefs_addrs(_run_json(_bn_argv(["xrefs", name], bn_inst)), False)
+        ghx = _xrefs_addrs(_run_json(_ghx_argv(["xrefs", name], ghx_inst)), True)
+        if bn is None or ghx is None:
+            continue
+        (bn_a, bn_d), (ghx_a, ghx_d) = bn, ghx
+        bn_total += len(bn_a)
+        ghx_total += len(ghx_a)
+        shared_total += len(bn_a & ghx_a)
+        bn_data_refs += bn_d
+        ghx_data_refs += ghx_d
+        if bn_a == ghx_a:
+            agree += 1
+        else:
+            diverged.append((name, bn_a - ghx_a, ghx_a - bn_a))
+    tag = "AGREE" if not diverged else "DIVERGE"
+    print(f"## xrefs: {tag}  ({agree}/{len(seeds)} seed names agree on callers; "
+          f"code-refs bn={bn_total} ghx={ghx_total} shared={shared_total})  key=address")
+    print(f"   note: data-refs (GOT/PLT slots, reported separately) "
+          f"bn={bn_data_refs} ghx={ghx_data_refs}")
+    for name, bn_only, ghx_only in diverged[:15]:
+        parts = []
+        if bn_only:
+            parts.append(f"bn-only {_fmt_keys(bn_only, 'address', 8)}")
+        if ghx_only:
+            parts.append(f"ghx-only {_fmt_keys(ghx_only, 'address', 8)}")
+        print(f"   {name}: " + "; ".join(parts))
+    if len(diverged) > 15:
+        print(f"   …(+{len(diverged) - 15} more diverging seeds)")
+    print()
+    return 1 if diverged else 0
+
+
+SEEDED_PROBES = {"xrefs": run_xrefs}
+ALL_PROBES = [*PROBES, *SEEDED_PROBES]
+
+
 def run(binary: str, bn_inst: str, ghx_inst: str | None, probes: list[str]) -> int:
     print(f"# A/B parity: {Path(binary).name}\n")
     diverged = 0
     for name in probes:
+        if name in SEEDED_PROBES:
+            diverged += SEEDED_PROBES[name](bn_inst, ghx_inst)
+            continue
         spec = PROBES[name]
         key = spec["key"]
         bn_data = _run_json(["bn", *spec["bn"], "--instance", bn_inst])
@@ -176,7 +285,7 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("binary", help="Path to the binary to compare (e.g. dogfood target)")
     ap.add_argument("--keep", action="store_true", help="Leave both engines loaded")
-    ap.add_argument("--probe", action="append", choices=list(PROBES),
+    ap.add_argument("--probe", action="append", choices=ALL_PROBES,
                     help="Run only these probes (repeatable; default: all)")
     ap.add_argument("--bn-instance", default=None,
                     help="Reuse an existing bn instance instead of starting one")
@@ -188,7 +297,7 @@ def main() -> int:
         print(f"binary not found: {binary}", file=sys.stderr)
         return 2
 
-    probes = ns.probe or list(PROBES)
+    probes = ns.probe or ALL_PROBES
     started_bn = False
     bn_inst = ns.bn_instance
     if bn_inst is None:

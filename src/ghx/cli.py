@@ -1046,6 +1046,9 @@ def _slice_lines(text: str, spec: str) -> str:
             help="Sort key: address (asc), name (asc), or size (desc)"),
         arg("--count", action="store_true",
             help="Show the function count instead of listing"),
+        arg("--include-externals", action="store_true",
+            help="Include Ghidra's synthetic EXTERNAL-block import thunks "
+                 "(hidden by default to match bn's function list)"),
     ],
 )
 def cmd_function_list(ns: argparse.Namespace) -> int:
@@ -1058,6 +1061,7 @@ def cmd_function_list(ns: argparse.Namespace) -> int:
             limit=ns.limit,
             sort=ns.sort,
             count=ns.count or None,
+            include_externals=ns.include_externals or None,
         )
     except BridgeError as exc:
         print(f"ghx function list: {exc}", file=sys.stderr)
@@ -1094,6 +1098,9 @@ def cmd_function_list(ns: argparse.Namespace) -> int:
         arg("query"),
         arg("--sort", choices=("address", "name", "size"), default="address",
             help="Sort key: address (asc), name (asc), or size (desc)"),
+        arg("--include-externals", action="store_true",
+            help="Include Ghidra's synthetic EXTERNAL-block import thunks "
+                 "(hidden by default to match bn)"),
     ],
     mutex_groups=[
         mutex(
@@ -1112,6 +1119,7 @@ def cmd_function_search(ns: argparse.Namespace) -> int:
             query=ns.query, regex=ns.regex or None, exact=ns.exact or None,
             min_address=ns.min_address, max_address=ns.max_address,
             offset=ns.offset, limit=ns.limit, sort=ns.sort,
+            include_externals=ns.include_externals or None,
         )
     except BridgeError as exc:
         print(f"ghx function search: {exc}", file=sys.stderr)
@@ -1452,6 +1460,10 @@ def _looks_like_crt_noise(row: dict[str, Any]) -> bool:
             help="Restrict to a specific section name (e.g. .rodata)"),
         arg("--no-crt", action="store_true",
             help="Heuristically drop CRT/locale/runtime noise strings"),
+        arg("--include-metadata", action="store_true",
+            help="Include strings in ELF metadata blocks (.shstrtab, "
+                 ".gnu_debuglink, section headers); excluded by default to "
+                 "match bn, which scans only the loaded image"),
         arg("--count", action="store_true",
             help="Show the matching string count instead of listing"),
     ],
@@ -1468,6 +1480,7 @@ def cmd_strings(ns: argparse.Namespace) -> int:
             regex=ns.regex or None,
             min_length=ns.min_length,
             section=ns.section,
+            include_metadata=ns.include_metadata or None,
             offset=None if ns.count else ns.offset,
             limit=None if ns.count else ns.limit,
             count=bridge_count or None,
