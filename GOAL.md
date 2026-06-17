@@ -65,18 +65,53 @@ When an exact equivalent doesn't exist, parity means **same agent task is
 achievable with the same number of calls and comparable signal** — document the
 mapping, don't fake the feature.
 
+## Parity is measured by AGREEMENT, not flag-matching (read this)
+
+Matching command names + flags is the easy 80% and was mostly already built.
+**Real parity = bn and ghx return semantically equivalent ANSWERS on the same
+binary.** A command can have identical `--help` and still disagree. Proven by an
+A/B run on `fw-A/bin-1` (2026-06-17, see ledger):
+
+| metric | bn | ghx | status |
+|---|---|---|---|
+| functions | 51 | 79 | **DIVERGES** — ghx likely counts thunks/auto-stubs bn omits |
+| imports | 59 | 84 | **DIVERGES** — ghx counts 28 externals + 56 thunks as rows |
+| strings | 104 | 125 | **DIVERGES** — different defined-string heuristics |
+| sections | 25 | 28 | **DIVERGES** — memory-block vs section modeling |
+| decompile 0x400f20 | 216 lines, `uint64_t` ret | 139 lines, `void` ret | engine difference |
+
+Every "[x]" below means the **surface** matches. It does NOT mean the answer
+matches bn. Re-grade against this A/B bar.
+
 ## Status snapshot (2026-06-17)
 
-- **Top-level command parity: DONE.** Every `bn` top-level command exists in
-  `ghx` except `plugin` (GUI extension — deliberately out of scope, see below).
-- **Sub-command parity: DONE.** `dataflow/taint/function/evidence/bundle/symbol/
-  comment/proto/local/struct/types/target/batch` all expose the same set of
-  second-level verbs.
-- **Out-of-box auto-spawn: FIXED** (ephemeral project now under
-  `/tmp/ghx-projects/<id>`, no dotted path element; `ghx doctor` cold-spawns
-  cleanly).
-- **Remaining gap = option-level + output-semantics + dataflow depth.** That is
-  the entire backlog below.
+- **Surface parity (commands/flags/output-shape): ~done.** Every `bn` verb exists
+  in `ghx` except `plugin` (GUI extension — out of scope). Option-level gaps,
+  friction-log signal issues, and P2 surface are closed (see ledger).
+- **Out-of-box auto-spawn: FIXED** (`/tmp/ghx-projects/<id>`).
+- **Semantic parity: NOT ESTABLISHED.** No command's answer has been verified to
+  match bn's. The A/B table above shows material divergence on the most basic
+  queries. This — plus dataflow depth — is the real remaining work.
+
+## P0(real) — semantic reconciliation (the actual parity work)
+
+Build the A/B harness and drive each command's answer to agree with bn, or
+document why it can't (genuine engine difference). Until this is done, parity is
+unproven regardless of how many flags match.
+- [ ] **A/B harness.** Script: spin an isolated bn instance (`--instance
+  <uniq>`, NEVER touch the sensitive ones — `bn instance list` shows ~20 real
+  targets) + a ghx daemon on the same binary; run each command both ways; diff
+  shapes/counts/answers; emit a divergence report. Stop only the instance you
+  started (`bn instance stop <id>`).
+- [ ] **Reconcile counting divergences.** imports (dedupe thunks vs externals?),
+  functions (exclude thunks/stubs to match bn's notion?), strings (min-len /
+  defined-string heuristic), sections. Decide per-command: match bn, or document
+  the engine difference in `note`/help. A 51-vs-79 function count is a real
+  agent-facing discrepancy.
+- [ ] **Decompiler/type divergence.** Naming (`sub_` vs `FUN_`), inferred return
+  types, line counts differ. Likely "document, don't force" — but verify the
+  *information* is equivalent (same logic recovered), not byte-identical text.
+- [ ] **Run it on a corpus, not one 13KB binary.** Multiple arches/sizes.
 
 ## Backlog (prioritized, grounded in the dogfood friction log + option diff)
 
@@ -273,6 +308,14 @@ already loaded speeds the loop. Keep all captured artifacts under `.dogfood/`.
 - **Adding an op:** follow the 6-step checklist in `CLAUDE.md` → "Adding a new op".
 
 ## Progress ledger (append one line per cycle — newest first)
+
+- 2026-06-17 — **Reality check (skeptic prompt).** Ran the first true A/B: same
+  binary in an isolated bn instance vs ghx. Counts DIVERGE (funcs 51/79, imports
+  59/84, strings 104/125, sections 25/28; decompile 216/139 lines, differing
+  return types). Conclusion: surface parity ≠ semantic parity; the latter is
+  unproven. Reframed GOAL.md — added the "agreement, not flag-matching" bar and a
+  P0(real) semantic-reconciliation workstream. The 9 prior commits are real
+  surface/ergonomics work, not parity.
 
 - 2026-06-17 — Documented `structured-il --form` ↔ bn `--view/--ssa/--no-ssa`
   mapping; recorded the full out-buffer-taint design (out-arg map, HighVariable
