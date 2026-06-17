@@ -1236,7 +1236,8 @@ def cmd_disasm(ns: argparse.Namespace) -> int:
     args=[
         arg("identifier"),
         arg("--form", choices=("raw", "high"), default="high",
-            help="raw per-instruction p-code, or high (SSA) p-code from the decompiler"),
+            help="raw per-instruction p-code (≈ bn --no-ssa), or high SSA p-code "
+                 "from the decompiler (≈ bn --ssa); Ghidra's analogue of bn --view"),
     ],
 )
 def cmd_function_structured_il(ns: argparse.Namespace) -> int:
