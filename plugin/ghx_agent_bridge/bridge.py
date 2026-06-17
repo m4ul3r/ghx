@@ -750,23 +750,34 @@ class GhxBridge:
             if hi is not None and off > hi:
                 continue
             items.append(_func_brief(fn))
-        items.sort(key=lambda row: int(row["address"], 16))
+        _sort_func_rows(items, str(params.get("sort") or "address"))
+        if params.get("count"):
+            return {"count": len(items)}
         if offset:
             items = items[offset:]
         if limit is not None:
             items = items[:limit]
         return items
 
-    def _op_search_functions(self, params: dict[str, Any], target: str | None) -> list[dict[str, Any]]:
+    def _op_search_functions(self, params: dict[str, Any], target: str | None):
         handle = self.targets.resolve(params.get("target") or target, required=True)
         assert handle is not None
         query = str(params.get("query", ""))
         regex = bool(params.get("regex", False))
+        exact = bool(params.get("exact", False))
         offset = int(params.get("offset", 0))
         limit = int(params["limit"]) if params.get("limit") is not None else None
         program = handle.program
 
-        if regex:
+        lo_s = params.get("min_address")
+        hi_s = params.get("max_address")
+        lo = _parse_address(program, lo_s) if lo_s is not None else None
+        hi = _parse_address(program, hi_s) if hi_s is not None else None
+
+        if exact:
+            def matches(name: str) -> bool:
+                return name == query
+        elif regex:
             import re as _re
 
             try:
@@ -785,9 +796,17 @@ class GhxBridge:
         items = []
         for fn in program.getFunctionManager().getFunctions(True):
             name = str(fn.getName())
-            if matches(name):
-                items.append(_func_brief(fn))
-        items.sort(key=lambda row: int(row["address"], 16))
+            if not matches(name):
+                continue
+            off = int(fn.getEntryPoint().getOffset())
+            if lo is not None and off < lo:
+                continue
+            if hi is not None and off > hi:
+                continue
+            items.append(_func_brief(fn))
+        _sort_func_rows(items, str(params.get("sort") or "address"))
+        if params.get("count"):
+            return {"count": len(items)}
         if offset:
             items = items[offset:]
         if limit is not None:
@@ -3487,6 +3506,18 @@ def _func_brief(fn: Any) -> dict[str, Any]:
         "is_thunk": bool(fn.isThunk()),
         "is_external": bool(fn.isExternal()),
     }
+
+
+def _sort_func_rows(items: list[dict[str, Any]], sort: str) -> list[dict[str, Any]]:
+    """Sort function-brief rows by 'address' (asc), 'name' (asc), or 'size'
+    (desc — biggest first, the useful order for triage). Ties break on address."""
+    if sort == "name":
+        items.sort(key=lambda r: (r["name"].lower(), int(r["address"], 16)))
+    elif sort == "size":
+        items.sort(key=lambda r: (-int(r["size"]), int(r["address"], 16)))
+    else:
+        items.sort(key=lambda r: int(r["address"], 16))
+    return items
 
 
 def _storage_str(var: Any) -> str | None:

@@ -1028,6 +1028,12 @@ def _slice_lines(text: str, spec: str) -> str:
 @command(
     "function", "list", help="List functions",
     target=True, paged=True, address_filter=True,
+    args=[
+        arg("--sort", choices=("address", "name", "size"), default="address",
+            help="Sort key: address (asc), name (asc), or size (desc)"),
+        arg("--count", action="store_true",
+            help="Show the function count instead of listing"),
+    ],
 )
 def cmd_function_list(ns: argparse.Namespace) -> int:
     try:
@@ -1037,11 +1043,19 @@ def cmd_function_list(ns: argparse.Namespace) -> int:
             max_address=ns.max_address,
             offset=ns.offset,
             limit=ns.limit,
+            sort=ns.sort,
+            count=ns.count or None,
         )
     except BridgeError as exc:
         print(f"ghx function list: {exc}", file=sys.stderr)
         return 1
-    rows = response["result"] or []
+    result = response["result"]
+    if ns.count:
+        payload = result if isinstance(result, dict) else {"count": len(result or [])}
+        _emit(payload, ns,
+              text_renderer=lambda r, o: o.write(f"{r.get('count', 0)} functions\n"))
+        return 0
+    rows = result or []
 
     def _render(rows, out):
         if not rows:
@@ -1062,18 +1076,29 @@ def cmd_function_list(ns: argparse.Namespace) -> int:
 
 @command(
     "function", "search", help="Search functions by name",
-    target=True, paged=True,
+    target=True, paged=True, address_filter=True,
     args=[
         arg("query"),
-        arg("--regex", action="store_true"),
+        arg("--sort", choices=("address", "name", "size"), default="address",
+            help="Sort key: address (asc), name (asc), or size (desc)"),
+    ],
+    mutex_groups=[
+        mutex(
+            False,
+            arg("--regex", action="store_true",
+                help="Interpret the query as a case-insensitive regular expression"),
+            arg("--exact", action="store_true",
+                help="Exact (case-sensitive) name match"),
+        ),
     ],
 )
 def cmd_function_search(ns: argparse.Namespace) -> int:
     try:
         response = _send(
             "search_functions", ns,
-            query=ns.query, regex=ns.regex,
-            offset=ns.offset, limit=ns.limit,
+            query=ns.query, regex=ns.regex or None, exact=ns.exact or None,
+            min_address=ns.min_address, max_address=ns.max_address,
+            offset=ns.offset, limit=ns.limit, sort=ns.sort,
         )
     except BridgeError as exc:
         print(f"ghx function search: {exc}", file=sys.stderr)
@@ -1082,7 +1107,7 @@ def cmd_function_search(ns: argparse.Namespace) -> int:
 
     def _render(rows, out):
         for r in rows:
-            out.write(f"{r['address']:>12}  {r['name']}\n")
+            out.write(f"{r['address']:>12}  {r['name']}  (size={r['size']})\n")
 
     _emit(rows, ns, text_renderer=_render)
     return 0

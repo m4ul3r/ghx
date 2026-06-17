@@ -144,8 +144,12 @@ ghx is missing these in several places:
   `fw-A/bin-1`). Verified.
 - [x] `sections`: added `--count`, `--limit`, `--offset` (address-sorted pages).
   Verified on `fw-A/bin-1`.
-- [ ] `function list`: add `--count`, `--sort`.
-- [ ] `function search`: add `--exact`, `--min-address`, `--max-address`, `--sort`.
+- [x] `function list`: added `--count` and `--sort {address,name,size}` (size is
+  descending — biggest first). Verified on `fw-A/bin-1` (79 functions; top-5
+  by size).
+- [x] `function search`: added `--exact` (case-sensitive, mutex with `--regex`),
+  `--min-address`/`--max-address`, and `--sort`. Render now shows size. Verified
+  on `fw-A/bin-1`.
 - [ ] `evidence xrefs`: add `--limit`, `--offset`. `evidence init`: add `--limit`.
 - [ ] `types`: bn exposes group-level `--count/--limit/--offset/--query`; ghx
   exposes these on the `types list` subcommand instead. Confirm the agent
@@ -236,6 +240,9 @@ already loaded speeds the loop. Keep all captured artifacts under `.dogfood/`.
 
 ## Progress ledger (append one line per cycle — newest first)
 
+- 2026-06-17 — P1 function ergonomics: `function list --count/--sort` and
+  `function search --exact/--min-address/--max-address/--sort` (shared
+  `_sort_func_rows`; `--exact` mutex with `--regex`). 165 green. Dogfooded.
 - 2026-06-17 — P1 IL slicing: `il --lines` and `disasm --lines` (CLI-side, reuses
   `_slice_lines`). Keeps large IL/disasm inline instead of spilling. 160 green.
 - 2026-06-17 — P1 VR-core: `callsites --caller-static` (return-address-first text
