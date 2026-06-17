@@ -37,6 +37,7 @@ def test_version_is_exposed(parser, capsys):
         ["session", "restart", "--timeout", "60"],
         ["instance", "prune"],
         ["instance", "prune", "--idle", "300"],
+        ["instance", "list"],
         ["load", "/bin/ls"],
         ["load", "/bin/ls", "--quick"],
         ["close"],

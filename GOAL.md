@@ -322,14 +322,16 @@ ghx is missing these in several places:
   funcs and reanalyze). ghx has `--timeout`; add `--force-analysis` equivalent.
 
 ### P2 — session / instance management
-bn unifies lifecycle under `instance {start,stop,restart,list,use,clear,prune}`
-and mirrors `session`. ghx splits: `session {list,start,stop,restart}` +
-`instance {use,clear,prune}`.
-- [ ] `session prune` — add (with `--dry-run`, `--idle`, `--include-gui`,
-  `--include-sticky` to match bn).
-- [ ] `instance` — add `list/start/stop/restart` (or alias to `session`) so the
-  two command names are interchangeable like bn's.
-- [ ] `instance prune` — add `--dry-run`, `--include-gui`, `--include-sticky`.
+CORRECTION (verified against bn 0.20.0 `--help`): the backlog below assumed a
+richer bn surface than exists. bn actually has `session {start,stop,restart,
+list}` and `instance {list,use,clear}` (where `instance list` is an alias for
+`session list`); bn has NO `prune` and NO `instance start/stop/restart`. ghx
+already has `session {list,start,stop,restart}` + `instance {use,clear,prune}` —
+i.e. ghx already meets or EXCEEDS bn's lifecycle surface (`instance prune` is a
+ghx extra).
+- [x] **`instance list`** — added as an alias for `session list`, matching bn's
+  one cross-name affordance. (`--dry-run`/`--include-gui`/`--include-sticky` and
+  `session prune` were phantom bn features — not in bn 0.20.0; dropped.)
 
 ### P2 — misc option parity
 - [x] `close --all` (closes every loaded program; returns `{closed:[...],count}`).

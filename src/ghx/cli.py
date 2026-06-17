@@ -605,6 +605,12 @@ def cmd_session_list(ns: argparse.Namespace) -> int:
     return 0
 
 
+@command("instance", "list", help="List running ghx-agent instances "
+                                  "(alias for `session list`)")
+def cmd_instance_list(ns: argparse.Namespace) -> int:
+    return cmd_session_list(ns)
+
+
 @command(
     "session", "start", help="Start a new ghx-agent daemon",
     args=[
