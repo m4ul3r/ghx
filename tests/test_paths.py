@@ -28,6 +28,21 @@ def test_bridge_paths_without_instance(tmp_cache):
     assert sock.parent == tmp_cache
 
 
+def test_projects_dir_avoids_dot_elements_on_default_cache(monkeypatch):
+    # The default cache home (~/.cache/ghx) contains the '.cache' element, which
+    # Ghidra's ProjectLocator rejects. projects_dir() must NOT return a path with
+    # any dot-prefixed element, or the daemon fails to open an ephemeral project.
+    monkeypatch.delenv("GHX_CACHE_DIR", raising=False)
+    pd = paths.projects_dir()
+    assert not any(part.startswith(".") for part in pd.resolve().parts), pd
+
+
+def test_projects_dir_uses_clean_cache_dir(tmp_path, monkeypatch):
+    # A GHX_CACHE_DIR with no dotted element hosts projects directly under it.
+    monkeypatch.setenv("GHX_CACHE_DIR", str(tmp_path))
+    assert paths.projects_dir() == tmp_path / "projects"
+
+
 def test_resolve_ghidra_install_dir_missing(monkeypatch, tmp_path):
     monkeypatch.delenv("GHIDRA_INSTALL_DIR", raising=False)
     monkeypatch.setattr(paths, "DEFAULT_GHIDRA_INSTALL_DIR", str(tmp_path / "nope"))

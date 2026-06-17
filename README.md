@@ -14,7 +14,7 @@ uv tool install -e /path/to/ghid
 
 Requires:
 - Python 3.11–3.13 (capped by JPype)
-- Ghidra 12+ at `/opt/ghidra_12.0.4_PUBLIC` (or set `GHIDRA_INSTALL_DIR`)
+- Ghidra 12+ at `/opt/ghidra_12.1.2_PUBLIC` (or set `GHIDRA_INSTALL_DIR`)
 
 ## Quickstart
 

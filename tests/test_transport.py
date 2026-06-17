@@ -11,7 +11,20 @@ from pathlib import Path
 
 import pytest
 
-from ghx import paths, transport
+from ghx import paths, pins, transport
+
+
+def _fake_instance(instance_id: str) -> transport.BridgeInstance:
+    return transport.BridgeInstance(
+        pid=1,
+        socket_path=Path(f"/tmp/{instance_id}.sock"),
+        registry_path=Path(f"/tmp/{instance_id}.json"),
+        plugin_name="ghx_agent_bridge",
+        plugin_version="test",
+        started_at=None,
+        meta={},
+        instance_id=instance_id,
+    )
 
 
 class _Handler(socketserver.StreamRequestHandler):
@@ -105,6 +118,70 @@ def test_send_request_bridges_error_into_exception(running_bridge):
 def test_choose_instance_raises_when_missing(tmp_cache):
     with pytest.raises(transport.BridgeError):
         transport.choose_instance("does-not-exist", auto_start=False)
+
+
+def test_choose_instance_honours_pin(tmp_cache, monkeypatch):
+    insts = [_fake_instance("aaaa"), _fake_instance("bbbb")]
+    monkeypatch.setattr(transport, "list_instances", lambda: insts)
+
+    # With two live instances and no pin, selection is ambiguous -> error.
+    with pytest.raises(transport.BridgeError):
+        transport.choose_instance(None, auto_start=False)
+
+    # A pin disambiguates.
+    pins.set_instance("bbbb")
+    assert transport.choose_instance(None, auto_start=False).instance_id == "bbbb"
+
+    # An explicit id still overrides the pin.
+    assert transport.choose_instance("aaaa", auto_start=False).instance_id == "aaaa"
+
+
+def test_choose_instance_ignores_stale_pin(tmp_cache, monkeypatch):
+    insts = [_fake_instance("aaaa")]
+    monkeypatch.setattr(transport, "list_instances", lambda: insts)
+    pins.set_instance("ghost")  # not among live instances
+
+    # Stale pin is ignored; the single live instance is returned.
+    assert transport.choose_instance(None, auto_start=False).instance_id == "aaaa"
+
+
+def test_read_log_tail_surfaces_error_marker(tmp_path):
+    log = tmp_path / "boot.log"
+    # Java exception header printed early, then a long stack, then noise.
+    lines = ["java.lang.IllegalArgumentException: Path element starting with '.' is not permitted"]
+    lines += [f"\tat ghidra.framework.Frame{i}.run(Frame{i}.java:{i})" for i in range(40)]
+    log.write_text("\n".join(lines) + "\n")
+
+    tail = transport._read_log_tail(log)
+    # The marked exception header survives even though it's far outside the tail window.
+    assert "not permitted" in tail
+    # And the tail end (recent stack frames) is present too.
+    assert "Frame39" in tail
+
+
+def test_read_log_tail_empty_log(tmp_path):
+    log = tmp_path / "empty.log"
+    log.write_text("   \n\n")
+    assert transport._read_log_tail(log) == ""
+
+
+def test_read_log_tail_missing_file(tmp_path):
+    assert transport._read_log_tail(tmp_path / "nope.log") == ""
+
+
+def test_spawn_failure_detail_includes_tail(tmp_path):
+    log = tmp_path / "boot.log"
+    log.write_text("Traceback (most recent call last):\nRuntimeError: boom\n")
+    detail = transport._spawn_failure_detail(log)
+    assert "RuntimeError: boom" in detail
+    assert str(log) in detail
+
+
+def test_spawn_failure_detail_falls_back_when_empty(tmp_path):
+    log = tmp_path / "empty.log"
+    log.write_text("")
+    detail = transport._spawn_failure_detail(log)
+    assert detail == f" Check {log}"
 
 
 def test_purges_stale_registry_when_socket_missing(tmp_cache):

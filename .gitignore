@@ -28,3 +28,15 @@ htmlcov/
 
 # ghx runtime output
 *.log
+*.sock
+
+# Secret targets / dogfood scratch — NEVER commit firmware or binary names.
+# Real target paths, decompiled output, and per-cycle notes live here only.
+.dogfood/
+DOGFOOD_*.local.md
+*.gzf
+*.gpr
+
+# Local scratch dirs (may hold target data) — never commit.
+oc_vibe*/
+tmp/

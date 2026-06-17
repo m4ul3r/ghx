@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from . import pins
 from .output import DEFAULT_SPILL_TOKEN_LIMIT, write_output_result
 from .paths import (
     bridge_registry_path,
@@ -157,7 +158,8 @@ _COMMANDS: list[dict[str, Any]] = []
 _GROUP_HELP: dict[tuple[str, ...], str] = {
     ("skill",): "Install the bundled Claude Code skill",
     ("session",): "Manage ghx-agent daemon processes",
-    ("target",): "Inspect loaded programs",
+    ("instance",): "Pin a default ghx-agent instance for subsequent calls",
+    ("target",): "Inspect and pin loaded programs",
     ("function",): "Function inspection",
     ("types",): "Data type manager",
     ("symbol",): "Symbol mutations",
@@ -166,6 +168,9 @@ _GROUP_HELP: dict[tuple[str, ...], str] = {
     ("local",): "Local variable rename/retype",
     ("struct",): "Structure edits",
     ("struct", "field"): "Operate on struct fields",
+    ("dataflow",): "SSA data-flow queries (def/use, value-set, callgraph)",
+    ("taint",): "Taint analysis (backward slice; forward)",
+    ("evidence",): "Aggregate evidence summaries for triage",
     ("bundle",): "Composite artifact exports",
     ("batch",): "Batch-apply multiple mutations in one transaction",
     ("py",): "Run Python inside the daemon",
@@ -341,13 +346,22 @@ def _emit(result: Any, ns: argparse.Namespace, *, text_renderer=None) -> None:
     sys.stdout.write(rendered.rendered)
 
 
+def _resolved_target(ns: argparse.Namespace) -> str | None:
+    """Explicit -t/--target wins; otherwise fall back to the sticky pin."""
+    return getattr(ns, "target", None) or pins.get_target()
+
+
 def _send(op: str, ns: argparse.Namespace, **params: Any) -> dict[str, Any]:
-    """Shared request helper: cleans out Nones, passes target + instance."""
+    """Shared request helper: cleans out Nones, passes target + instance.
+
+    A missing ``-t`` falls back to the pinned target; a missing ``--instance``
+    falls back to the pinned instance inside ``choose_instance``.
+    """
     payload = {k: v for k, v in params.items() if v is not None}
     return send_request(
         op,
         params=payload,
-        target=getattr(ns, "target", None),
+        target=_resolved_target(ns),
         instance_id=getattr(ns, "instance", None),
         timeout=getattr(ns, "_transport_timeout", None),
     )
@@ -432,6 +446,51 @@ def _render_function_text(result: dict[str, Any], out, header_suffix: str = "") 
     out.write(text)
     if not text.endswith("\n"):
         out.write("\n")
+
+
+def _vn_tok(vn: dict[str, Any] | None) -> str:
+    """Render a varnode descriptor as a short token for structured-il text."""
+    if vn is None:
+        return "-"
+    if vn.get("var"):
+        return str(vn["var"])
+    kind = vn.get("kind")
+    off = vn.get("offset")
+    if kind == "const":
+        return f"#{vn.get('value')}"
+    if kind == "register":
+        return str(vn.get("register") or f"reg+{off}")
+    if kind == "unique":
+        return f"u{off:#x}" if isinstance(off, int) else f"u:{off}"
+    if kind == "ram":
+        return f"ram:0x{off:x}" if isinstance(off, int) else f"ram:{off}"
+    return f"{vn.get('space', '?')}:{off}"
+
+
+def _render_structured_il(result: dict[str, Any], out) -> None:
+    fn = result.get("function", {})
+    out.write(
+        f"// {fn.get('name')} @ {fn.get('address')}  "
+        f"(form={result.get('form')}, {result.get('op_count', 0)} ops)\n"
+    )
+    for op in result.get("ops", []):
+        ins = ", ".join(_vn_tok(v) for v in op.get("inputs", []))
+        lhs = f"{_vn_tok(op.get('output'))} = " if op.get("output") else ""
+        out.write(f"{op.get('address')}  {lhs}{op.get('op')} {ins}\n")
+
+
+def _render_read(result: dict[str, Any], out) -> None:
+    base = int(result.get("address", "0x0"), 16)
+    out.write(
+        f"{result.get('address')}  "
+        f"({result.get('length_read')}/{result.get('length_requested')} bytes)\n"
+    )
+    data = bytes.fromhex(result.get("bytes_hex", "") or "")
+    for i in range(0, len(data), 16):
+        chunk = data[i:i + 16]
+        hexpart = " ".join(f"{b:02x}" for b in chunk)
+        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        out.write(f"  0x{base + i:x}  {hexpart:<47}  {asc}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +605,12 @@ def cmd_session_list(ns: argparse.Namespace) -> int:
     return 0
 
 
+@command("instance", "list", help="List running ghx-agent instances "
+                                  "(alias for `session list`)")
+def cmd_instance_list(ns: argparse.Namespace) -> int:
+    return cmd_session_list(ns)
+
+
 @command(
     "session", "start", help="Start a new ghx-agent daemon",
     args=[
@@ -554,7 +619,7 @@ def cmd_session_list(ns: argparse.Namespace) -> int:
         arg("--project-name", default=None,
             help="Ghidra project name (default: ghx-<instance_id>)"),
         arg("--install-dir", default=None,
-            help="Ghidra installation directory (default: $GHIDRA_INSTALL_DIR or /opt/ghidra_12.0.4_PUBLIC)"),
+            help="Ghidra installation directory (default: $GHIDRA_INSTALL_DIR or /opt/ghidra_12.1.2_PUBLIC)"),
     ],
 )
 def cmd_session_start(ns: argparse.Namespace) -> int:
@@ -603,6 +668,88 @@ def cmd_session_stop(ns: argparse.Namespace) -> int:
     return 0
 
 
+def _wait_instance_gone(inst, timeout: float = 8.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not inst.socket_path.exists() and not inst.registry_path.exists():
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(inst.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+@command(
+    "session", "restart",
+    help="Stop an instance and respawn it (same id), reloading its targets",
+    args=[
+        arg("--install-dir", default=None, help="Ghidra installation directory"),
+        arg("--timeout", type=float, default=120.0,
+            help="Per-target reload timeout in seconds (default: 120)"),
+    ],
+)
+def cmd_session_restart(ns: argparse.Namespace) -> int:
+    try:
+        inst = choose_instance(ns.instance, auto_start=False)
+    except BridgeError as exc:
+        print(f"ghx session restart: {exc}", file=sys.stderr)
+        return 1
+    instance_id = inst.instance_id
+
+    # Capture state to restore after respawn.
+    doc = {}
+    targets = []
+    try:
+        doc = send_request("doctor", instance_id=instance_id)["result"]
+    except BridgeError:
+        pass
+    try:
+        targets = send_request("list_targets", instance_id=instance_id)["result"]
+    except BridgeError:
+        pass
+    files = [t.get("filename") for t in targets if t.get("filename")]
+    ephemeral = doc.get("project_ephemeral", True)
+    project_path = doc.get("project_path")
+    project_name = doc.get("project_name")
+
+    # Stop the old instance and wait for it to release its socket/registry.
+    try:
+        send_request("shutdown", instance_id=instance_id, timeout=5.0)
+    except BridgeError:
+        pass
+    _wait_instance_gone(inst)
+    time.sleep(0.3)
+
+    extra: list[str] = []
+    if not ephemeral and project_path:
+        extra += ["--project", project_path]
+        if project_name:
+            extra += ["--project-name", project_name]
+    if ns.install_dir:
+        extra += ["--install-dir", ns.install_dir]
+    try:
+        new = spawn_instance(instance_id=instance_id, extra_args=extra or None)
+    except BridgeError as exc:
+        print(f"ghx session restart: respawn failed: {exc}", file=sys.stderr)
+        return 1
+
+    reloaded = 0
+    for path in files:
+        try:
+            send_request("load_binary", params={"path": path},
+                         instance_id=instance_id, timeout=ns.timeout)
+            reloaded += 1
+        except BridgeError as exc:
+            print(f"  reload failed: {path}: {exc}", file=sys.stderr)
+
+    print(
+        f"restarted  instance={instance_id or 'default'}  pid={new.pid}  "
+        f"reloaded={reloaded}/{len(files)}"
+    )
+    return 0
+
+
 @command(
     "load",
     help="Import a binary into the daemon's project",
@@ -611,6 +758,8 @@ def cmd_session_stop(ns: argparse.Namespace) -> int:
         arg("path", help="Path to the binary file"),
         arg("--timeout", type=float, default=120.0,
             help="Request timeout in seconds (default: 120; first-load analysis can be slow)"),
+        arg("--quick", action="store_true",
+            help="Import without auto-analysis (fast); deepen later with `ghx refresh`"),
     ],
 )
 def cmd_load(ns: argparse.Namespace) -> int:
@@ -621,7 +770,7 @@ def cmd_load(ns: argparse.Namespace) -> int:
     try:
         response = send_request(
             "load_binary",
-            params={"path": str(path)},
+            params={"path": str(path), "quick": ns.quick},
             instance_id=ns.instance,
             timeout=ns.timeout,
         )
@@ -630,27 +779,37 @@ def cmd_load(ns: argparse.Namespace) -> int:
         return 1
 
     def _render(p, out):
+        tag = "" if p.get("analyzed", True) else "  (quick: not analyzed — run `ghx refresh`)"
         out.write(
             f"loaded  {p.get('basename')}  id={p.get('program_id')}  "
-            f"[{p.get('language')}]  size={p.get('size')}\n"
+            f"[{p.get('language')}]  size={p.get('size')}{tag}\n"
         )
 
     _emit(response["result"], ns, text_renderer=_render)
     return 0
 
 
-@command("close", help="Release a loaded program", target=True)
+@command("close", help="Release a loaded program", target=True,
+         args=[arg("--all", action="store_true", help="Close all loaded programs")])
 def cmd_close(ns: argparse.Namespace) -> int:
     try:
         response = _send(
             "close_binary", ns,
             selector=ns.target,
+            all=ns.all or None,
         )
     except BridgeError as exc:
         print(f"ghx close: {exc}", file=sys.stderr)
         return 1
-    _emit(response["result"], ns,
-          text_renderer=lambda p, o: o.write(f"closed  {p.get('program_id')}\n"))
+
+    def _render(p, out):
+        if isinstance(p.get("closed"), list):
+            ids = ", ".join(p["closed"]) or "(none)"
+            out.write(f"closed  {p.get('count', len(p['closed']))} program(s): {ids}\n")
+        else:
+            out.write(f"closed  {p.get('program_id')}\n")
+
+    _emit(response["result"], ns, text_renderer=_render)
     return 0
 
 
@@ -678,6 +837,101 @@ def cmd_target_list(ns: argparse.Namespace) -> int:
     return 0
 
 
+@command(
+    "instance", "use", help="Pin a default ghx-agent instance for subsequent calls",
+    fmt="text", args=[arg("instance_id", help="Instance id to pin (see `ghx session list`)")],
+)
+def cmd_instance_use(ns: argparse.Namespace) -> int:
+    pins.set_instance(ns.instance_id)
+    live = {inst.instance_id for inst in list_instances()}
+    note = "" if ns.instance_id in live else "  (warning: no live instance with this id yet)"
+    print(f"pinned instance {ns.instance_id}{note}")
+    return 0
+
+
+@command("instance", "clear", help="Clear the pinned ghx-agent instance", fmt="text")
+def cmd_instance_clear(ns: argparse.Namespace) -> int:
+    had = pins.clear_instance()
+    print("cleared pinned instance" if had else "no instance was pinned")
+    return 0
+
+
+def _instance_idle_seconds(inst, now) -> float | None:
+    """Seconds since an instance last served a request (or started), or None if
+    no timestamp is available. `now` is a timezone-aware datetime."""
+    import datetime as _dt
+
+    meta = getattr(inst, "meta", None) or {}
+    ts = meta.get("last_active") or meta.get("started_at") or getattr(inst, "started_at", None)
+    if not ts:
+        return None
+    try:
+        dt = _dt.datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    return (now - dt).total_seconds()
+
+
+def _select_idle_instances(instances, threshold, now):
+    """Partition instances into (to_prune, to_keep) by idle threshold."""
+    to_prune, to_keep = [], []
+    for inst in instances:
+        idle = _instance_idle_seconds(inst, now)
+        if idle is not None and idle >= threshold:
+            to_prune.append((inst, idle))
+        else:
+            to_keep.append((inst, idle))
+    return to_prune, to_keep
+
+
+@command(
+    "instance", "prune", help="Stop ghx-agent instances idle longer than --idle",
+    fmt="text",
+    args=[arg("--idle", type=float, default=900.0,
+              help="Idle threshold in seconds (default: 900)")],
+)
+def cmd_instance_prune(ns: argparse.Namespace) -> int:
+    import datetime as _dt
+
+    instances = list_instances()
+    if not instances:
+        print("(no running ghx-agent instances)")
+        return 0
+    now = _dt.datetime.now(_dt.timezone.utc)
+    to_prune, to_keep = _select_idle_instances(instances, ns.idle, now)
+
+    for inst, idle in to_prune:
+        try:
+            send_request("shutdown", instance_id=inst.instance_id, timeout=5.0)
+        except BridgeError:
+            pass
+        _wait_instance_gone(inst, timeout=5.0)
+        print(f"pruned  {inst.instance_id or 'default'}  (idle {idle:.0f}s)")
+    for inst, idle in to_keep:
+        shown = f"{idle:.0f}s" if idle is not None else "?"
+        print(f"kept    {inst.instance_id or 'default'}  (idle {shown})")
+    return 0
+
+
+@command(
+    "target", "use", help="Pin a default target program selector for subsequent calls",
+    fmt="text", args=[arg("selector", help="Target selector (program_id, basename, filename, or 'active')")],
+)
+def cmd_target_use(ns: argparse.Namespace) -> int:
+    pins.set_target(ns.selector)
+    print(f"pinned target {ns.selector}")
+    return 0
+
+
+@command("target", "clear", help="Clear the pinned target program", fmt="text")
+def cmd_target_clear(ns: argparse.Namespace) -> int:
+    had = pins.clear_target()
+    print("cleared pinned target" if had else "no target was pinned")
+    return 0
+
+
 @command("refresh", help="Re-run auto-analysis on the selected target", target=True)
 def cmd_refresh(ns: argparse.Namespace) -> int:
     try:
@@ -700,29 +954,38 @@ def cmd_refresh(ns: argparse.Namespace) -> int:
 
 
 @command(
-    "save", help="Persist the current program to its project domain file",
+    "save", help="Persist the program (to its project file, or export .gzf to PATH)",
     target=True,
-    args=[arg("path", nargs="?", default=None,
-              help="Unused in v1 (Ghidra saves to the existing DomainFile path)")],
+    args=[
+        arg("path", nargs="?", default=None,
+            help="Export a Ghidra Zip File (.gzf) to PATH instead of saving in-project"),
+        arg("--path", dest="path_flag", default=None,
+            help="Output path (alias for the positional)"),
+    ],
 )
 def cmd_save(ns: argparse.Namespace) -> int:
     try:
-        response = _send("save_database", ns, path=ns.path)
+        response = _send("save_database", ns, path=ns.path_flag or ns.path)
     except BridgeError as exc:
         print(f"ghx save: {exc}", file=sys.stderr)
         return 1
 
     def _render(r, out):
-        out.write(f"saved  {r.get('path')}  (id={r.get('program_id')})\n")
+        verb = "exported" if r.get("exported") else "saved"
+        fmt = f"  [{r.get('format')}]" if r.get("exported") else ""
+        out.write(f"{verb}  {r.get('path')}{fmt}  (id={r.get('program_id')})\n")
 
     _emit(response["result"], ns, text_renderer=_render)
     return 0
 
 
-@command("target", "info", help="Describe a loaded program", target=True)
+@command("target", "info", help="Describe a loaded program", target=True,
+         args=[arg("-v", "--verbose", action="store_true",
+                   help="Include the segment map (r/w/x address ranges)")])
 def cmd_target_info(ns: argparse.Namespace) -> int:
     try:
-        response = _send("target_info", ns, selector=ns.target)
+        response = _send("target_info", ns, selector=ns.target,
+                         verbose=ns.verbose or None)
     except BridgeError as exc:
         print(f"ghx target info: {exc}", file=sys.stderr)
         return 1
@@ -756,7 +1019,7 @@ def cmd_decompile(ns: argparse.Namespace) -> int:
                 "timeout": ns.timeout,
                 "addresses": ns.addresses,
             },
-            target=ns.target,
+            target=_resolved_target(ns),
             instance_id=ns.instance,
             timeout=ns.timeout + 5.0,
         )
@@ -787,6 +1050,15 @@ def _slice_lines(text: str, spec: str) -> str:
 @command(
     "function", "list", help="List functions",
     target=True, paged=True, address_filter=True,
+    args=[
+        arg("--sort", choices=("address", "name", "size"), default="address",
+            help="Sort key: address (asc), name (asc), or size (desc)"),
+        arg("--count", action="store_true",
+            help="Show the function count instead of listing"),
+        arg("--include-externals", action="store_true",
+            help="Include Ghidra's synthetic EXTERNAL-block import thunks "
+                 "(hidden by default to match bn's function list)"),
+    ],
 )
 def cmd_function_list(ns: argparse.Namespace) -> int:
     try:
@@ -796,11 +1068,20 @@ def cmd_function_list(ns: argparse.Namespace) -> int:
             max_address=ns.max_address,
             offset=ns.offset,
             limit=ns.limit,
+            sort=ns.sort,
+            count=ns.count or None,
+            include_externals=ns.include_externals or None,
         )
     except BridgeError as exc:
         print(f"ghx function list: {exc}", file=sys.stderr)
         return 1
-    rows = response["result"] or []
+    result = response["result"]
+    if ns.count:
+        payload = result if isinstance(result, dict) else {"count": len(result or [])}
+        _emit(payload, ns,
+              text_renderer=lambda r, o: o.write(f"{r.get('count', 0)} functions\n"))
+        return 0
+    rows = result or []
 
     def _render(rows, out):
         if not rows:
@@ -821,18 +1102,33 @@ def cmd_function_list(ns: argparse.Namespace) -> int:
 
 @command(
     "function", "search", help="Search functions by name",
-    target=True, paged=True,
+    target=True, paged=True, address_filter=True,
     args=[
         arg("query"),
-        arg("--regex", action="store_true"),
+        arg("--sort", choices=("address", "name", "size"), default="address",
+            help="Sort key: address (asc), name (asc), or size (desc)"),
+        arg("--include-externals", action="store_true",
+            help="Include Ghidra's synthetic EXTERNAL-block import thunks "
+                 "(hidden by default to match bn)"),
+    ],
+    mutex_groups=[
+        mutex(
+            False,
+            arg("--regex", action="store_true",
+                help="Interpret the query as a case-insensitive regular expression"),
+            arg("--exact", action="store_true",
+                help="Exact (case-sensitive) name match"),
+        ),
     ],
 )
 def cmd_function_search(ns: argparse.Namespace) -> int:
     try:
         response = _send(
             "search_functions", ns,
-            query=ns.query, regex=ns.regex,
-            offset=ns.offset, limit=ns.limit,
+            query=ns.query, regex=ns.regex or None, exact=ns.exact or None,
+            min_address=ns.min_address, max_address=ns.max_address,
+            offset=ns.offset, limit=ns.limit, sort=ns.sort,
+            include_externals=ns.include_externals or None,
         )
     except BridgeError as exc:
         print(f"ghx function search: {exc}", file=sys.stderr)
@@ -841,7 +1137,7 @@ def cmd_function_search(ns: argparse.Namespace) -> int:
 
     def _render(rows, out):
         for r in rows:
-            out.write(f"{r['address']:>12}  {r['name']}\n")
+            out.write(f"{r['address']:>12}  {r['name']}  (size={r['size']})\n")
 
     _emit(rows, ns, text_renderer=_render)
     return 0
@@ -905,25 +1201,47 @@ def cmd_function_info(ns: argparse.Namespace) -> int:
     args=[
         arg("identifier"),
         arg("--form", choices=("raw", "high"), default="raw",
-            help="raw p-code per instruction, or high p-code from decompiler (SSA-like)"),
+            help="raw p-code per instruction, or high p-code from decompiler "
+                 "(SSA form; the Ghidra analogue of bn's --ssa hlil/mlil)"),
+        arg("--raw", action="store_true",
+            help="Emit Ghidra's unformatted PcodeOp dump (raw varnode tuples) "
+                 "instead of the named, formatted p-code"),
+        arg("--indirect", action="store_true",
+            help="Show INDIRECT call/store side-effect ops in high p-code "
+                 "(hidden by default; always present in --format json ops[])"),
+        arg("--lines", default=None, metavar="START:END",
+            help="Slice the output to lines START:END (1-indexed; either endpoint optional)"),
     ],
 )
 def cmd_il(ns: argparse.Namespace) -> int:
     try:
-        response = _send("il", ns, identifier=ns.identifier, form=ns.form)
+        response = _send(
+            "il", ns, identifier=ns.identifier, form=ns.form,
+            raw=ns.raw, indirect=ns.indirect,
+        )
     except BridgeError as exc:
         print(f"ghx il: {exc}", file=sys.stderr)
         return 1
+    result = response["result"]
+    if ns.lines:
+        result = dict(result)
+        result["text"] = _slice_lines(result.get("text", ""), ns.lines)
     _emit(
-        response["result"], ns,
-        text_renderer=lambda r, o: _render_function_text(r, o, f"  (form={r.get('form')})"),
+        result, ns,
+        text_renderer=lambda r, o: _render_function_text(
+            r, o, f"  (form={r.get('form')}{', raw' if r.get('raw') else ''})"
+        ),
     )
     return 0
 
 
 @command(
     "disasm", help="Dump a function's disassembly", target=True,
-    args=[arg("identifier")],
+    args=[
+        arg("identifier"),
+        arg("--lines", default=None, metavar="START:END",
+            help="Slice the output to lines START:END (1-indexed; either endpoint optional)"),
+    ],
 )
 def cmd_disasm(ns: argparse.Namespace) -> int:
     try:
@@ -931,13 +1249,97 @@ def cmd_disasm(ns: argparse.Namespace) -> int:
     except BridgeError as exc:
         print(f"ghx disasm: {exc}", file=sys.stderr)
         return 1
-    _emit(response["result"], ns, text_renderer=_render_function_text)
+    result = response["result"]
+    if ns.lines:
+        result = dict(result)
+        result["text"] = _slice_lines(result.get("text", ""), ns.lines)
+    _emit(result, ns, text_renderer=_render_function_text)
+    return 0
+
+
+@command(
+    "function", "structured-il",
+    help="Per-pcode-op structured IL (op, inputs, output) for data-flow tooling",
+    fmt="json", target=True,
+    args=[
+        arg("identifier"),
+        arg("--form", choices=("raw", "high"), default="high",
+            help="raw per-instruction p-code (≈ bn --no-ssa), or high SSA p-code "
+                 "from the decompiler (≈ bn --ssa); Ghidra's analogue of bn --view"),
+    ],
+)
+def cmd_function_structured_il(ns: argparse.Namespace) -> int:
+    try:
+        response = _send("structured_il", ns, identifier=ns.identifier, form=ns.form)
+    except BridgeError as exc:
+        print(f"ghx function structured-il: {exc}", file=sys.stderr)
+        return 1
+    _emit(response["result"], ns, text_renderer=_render_structured_il)
+    return 0
+
+
+@command(
+    "function", "create",
+    help="Create and analyze a function at an address auto-analysis missed",
+    fmt="json", target=True,
+    args=[
+        arg("address", help="Entry-point address (hex 0x.. or decimal)"),
+        arg("--name", default=None, help="Name for the new function (default: auto)"),
+        arg("--preview", action="store_true",
+            help="Apply, capture diff, and roll back the transaction"),
+    ],
+)
+def cmd_function_create(ns: argparse.Namespace) -> int:
+    try:
+        response = _send("create_function", ns, address=ns.address,
+                         name=ns.name, preview=ns.preview)
+    except BridgeError as exc:
+        print(f"ghx function create: {exc}", file=sys.stderr)
+        return 1
+    _emit(response["result"], ns, text_renderer=_render_mutation)
+    return 0
+
+
+@command(
+    "read", help="Read raw bytes from program memory at an address", target=True,
+    args=[
+        arg("address", nargs="?", default=None,
+            help="Address to read from (hex 0x.. or decimal)"),
+        arg("--address", dest="address_flag", default=None,
+            help="Address to read from (alias for the positional)"),
+        arg("-n", "--length", type=int, default=16,
+            help="Number of bytes to read (default: 16, max: 65536)"),
+        arg("--encoding", choices=("hex", "bytes"), default="hex",
+            help="Byte payload: hex hexdump (default) or raw bytes (to --out or stdout)"),
+    ],
+)
+def cmd_read(ns: argparse.Namespace) -> int:
+    address = ns.address_flag or ns.address
+    if address is None:
+        print("ghx read: provide an address (positional or --address)", file=sys.stderr)
+        return 2
+    try:
+        response = _send("read_bytes", ns, address=address, length=ns.length)
+    except BridgeError as exc:
+        print(f"ghx read: {exc}", file=sys.stderr)
+        return 1
+    result = response["result"]
+    if ns.encoding == "bytes":
+        data = bytes.fromhex(result.get("bytes_hex", "") or "")
+        out_path = _resolve_out(ns)
+        if out_path:
+            Path(out_path).expanduser().write_bytes(data)
+            print(f"wrote {len(data)} bytes to {out_path}")
+        else:
+            sys.stdout.buffer.write(data)
+        return 0
+    _emit(result, ns, text_renderer=_render_read)
     return 0
 
 
 @command(
     "xrefs", help="Cross-references to an address, symbol, or struct field",
-    target=True,
+    target=True, paged=True,
     args=[
         arg("identifier", nargs="?",
             help="Address or symbol; omit when using --field"),
@@ -968,12 +1370,21 @@ def cmd_xrefs(ns: argparse.Namespace) -> int:
         try:
             response = send_request(
                 "field_xrefs", params=params,
-                target=ns.target, instance_id=ns.instance, timeout=None,
+                target=_resolved_target(ns), instance_id=ns.instance, timeout=None,
             )
         except BridgeError as exc:
             print(f"ghx xrefs: {exc}", file=sys.stderr)
             return 1
         result = response["result"]
+        # The field scan computes all refs up front; apply --offset/--limit
+        # client-side so paging is uniform with the address/symbol path.
+        if ns.offset or ns.limit is not None:
+            all_refs = result.get("code_refs", []) or []
+            result["code_refs_total"] = len(all_refs)
+            sliced = all_refs[ns.offset:]
+            if ns.limit is not None:
+                sliced = sliced[: ns.limit]
+            result["code_refs"] = sliced
 
         def _render_field(r, out):
             f = r.get("field", {})
@@ -984,7 +1395,9 @@ def cmd_xrefs(ns: argparse.Namespace) -> int:
             )
             out.write(f"scanned   {r.get('scanned_functions')} function(s)\n")
             refs = r.get("code_refs", [])
-            out.write(f"code_refs ({len(refs)})\n")
+            total = r.get("code_refs_total")
+            shown = f"{len(refs)} of {total}" if total is not None else str(len(refs))
+            out.write(f"code_refs ({shown})\n")
             for x in refs:
                 out.write(
                     f"  {x['address']:>12}  {x['function']:<32}  "
@@ -998,7 +1411,8 @@ def cmd_xrefs(ns: argparse.Namespace) -> int:
         print("ghx xrefs: provide an identifier or use --field", file=sys.stderr)
         return 2
     try:
-        response = _send("xrefs", ns, identifier=ns.identifier)
+        response = _send("xrefs", ns, identifier=ns.identifier,
+                         offset=ns.offset, limit=ns.limit)
     except BridgeError as exc:
         print(f"ghx xrefs: {exc}", file=sys.stderr)
         return 1
@@ -1008,7 +1422,9 @@ def cmd_xrefs(ns: argparse.Namespace) -> int:
         out.write(f"target   {r.get('target')}\n")
         incoming = r.get("incoming", []) or []
         outgoing = r.get("outgoing", []) or []
-        out.write(f"incoming ({len(incoming)})\n")
+        total = r.get("incoming_total")
+        shown = f"{len(incoming)} of {total}" if total is not None and total != len(incoming) else str(len(incoming))
+        out.write(f"incoming ({shown})\n")
         for x in incoming:
             func = x.get("function") or "-"
             out.write(
@@ -1057,29 +1473,57 @@ def _looks_like_crt_noise(row: dict[str, Any]) -> bool:
     target=True, paged=True,
     args=[
         arg("--query", default=None, help="substring filter (case-insensitive)"),
+        arg("--regex", action="store_true",
+            help="Interpret --query as a case-insensitive regular expression"),
         arg("--min-length", type=int, default=1),
         arg("--section", default=None,
             help="Restrict to a specific section name (e.g. .rodata)"),
         arg("--no-crt", action="store_true",
             help="Heuristically drop CRT/locale/runtime noise strings"),
+        arg("--include-metadata", action="store_true",
+            help="Include strings in ELF metadata blocks (.shstrtab, "
+                 ".gnu_debuglink, section headers); excluded by default to "
+                 "match bn, which scans only the loaded image"),
+        arg("--count", action="store_true",
+            help="Show the matching string count instead of listing"),
     ],
 )
 def cmd_strings(ns: argparse.Namespace) -> int:
+    # `--no-crt` is a client-side heuristic, so when it's combined with --count
+    # we must fetch the full matching set and count after filtering; otherwise
+    # the daemon can count directly and skip transferring the bodies.
+    bridge_count = ns.count and not ns.no_crt
     try:
         response = _send(
             "strings", ns,
             query=ns.query,
+            regex=ns.regex or None,
             min_length=ns.min_length,
             section=ns.section,
-            offset=ns.offset,
-            limit=ns.limit,
+            include_metadata=ns.include_metadata or None,
+            offset=None if ns.count else ns.offset,
+            limit=None if ns.count else ns.limit,
+            count=bridge_count or None,
         )
     except BridgeError as exc:
         print(f"ghx strings: {exc}", file=sys.stderr)
         return 1
-    rows = response["result"] or []
+    result = response["result"]
+
+    def _render_count(payload, out):
+        out.write(f"{payload.get('count', 0)} strings\n")
+
+    if bridge_count:
+        payload = result if isinstance(result, dict) else {"count": len(result or [])}
+        _emit(payload, ns, text_renderer=_render_count)
+        return 0
+
+    rows = result or []
     if ns.no_crt:
         rows = [r for r in rows if not _looks_like_crt_noise(r)]
+    if ns.count:  # --count combined with --no-crt: count the filtered rows
+        _emit({"count": len(rows)}, ns, text_renderer=_render_count)
+        return 0
 
     def _render(rows, out):
         for r in rows:
@@ -1089,14 +1533,50 @@ def cmd_strings(ns: argparse.Namespace) -> int:
     return 0
 
 
-@command("imports", help="List imported symbols + thunks", target=True)
+@command(
+    "imports", help="List imported symbols + thunks", target=True, paged=True,
+    args=[
+        arg("--summary", action="store_true",
+            help="Show aggregate counts by library and kind instead of the list"),
+        arg("--count", action="store_true",
+            help="Show the total import count instead of listing"),
+    ],
+)
 def cmd_imports(ns: argparse.Namespace) -> int:
     try:
-        response = _send("imports", ns)
+        response = _send(
+            "imports", ns,
+            summary=ns.summary or None,
+            count=ns.count or None,
+            offset=ns.offset,
+            limit=ns.limit,
+        )
     except BridgeError as exc:
         print(f"ghx imports: {exc}", file=sys.stderr)
         return 1
-    rows = response["result"] or []
+    result = response["result"]
+
+    if ns.summary:
+        def _render_summary(s, out):
+            out.write(f"total     {s.get('total', 0)}\n")
+            kind = s.get("by_kind", {})
+            out.write(
+                f"kinds     external={kind.get('external', 0)}  "
+                f"thunk={kind.get('thunk', 0)}\n"
+            )
+            out.write("by library\n")
+            for lib, n in (s.get("by_library") or {}).items():
+                out.write(f"  {n:>5}  {lib}\n")
+
+        _emit(result, ns, text_renderer=_render_summary)
+        return 0
+
+    if ns.count:
+        payload = result if isinstance(result, dict) else {"count": len(result or [])}
+        _emit(payload, ns, text_renderer=lambda r, out: out.write(f"{r.get('count', 0)} imports\n"))
+        return 0
+
+    rows = result or []
 
     def _render(rows, out):
         for r in rows:
@@ -1109,15 +1589,27 @@ def cmd_imports(ns: argparse.Namespace) -> int:
 
 
 @command(
-    "sections", help="List memory blocks", target=True,
-    args=[arg("--query", default=None)],
+    "sections", help="List memory blocks", target=True, paged=True,
+    args=[
+        arg("--query", default=None),
+        arg("--count", action="store_true",
+            help="Show the section count instead of listing"),
+    ],
 )
 def cmd_sections(ns: argparse.Namespace) -> int:
     try:
-        response = _send("sections", ns, query=ns.query)
+        response = _send(
+            "sections", ns, query=ns.query,
+            count=ns.count or None, offset=ns.offset, limit=ns.limit,
+        )
     except BridgeError as exc:
         print(f"ghx sections: {exc}", file=sys.stderr)
         return 1
+    if ns.count:
+        result = response["result"]
+        payload = result if isinstance(result, dict) else {"count": len(result or [])}
+        _emit(payload, ns, text_renderer=lambda r, out: out.write(f"{r.get('count', 0)} sections\n"))
+        return 0
     rows = response["result"] or []
 
     def _render(rows, out):
@@ -1135,20 +1627,31 @@ def cmd_sections(ns: argparse.Namespace) -> int:
 @command(
     "types", "list", help="List data types",
     target=True, paged=True,
-    args=[arg("--query", default=None)],
+    args=[
+        arg("--query", default=None),
+        arg("--count", action="store_true",
+            help="Show the matching type count instead of listing"),
+    ],
 )
 def cmd_types(ns: argparse.Namespace) -> int:
     try:
         response = _send(
             "types", ns,
             query=ns.query,
-            offset=ns.offset,
-            limit=ns.limit,
+            offset=None if ns.count else ns.offset,
+            limit=None if ns.count else ns.limit,
+            count=ns.count or None,
         )
     except BridgeError as exc:
         print(f"ghx types list: {exc}", file=sys.stderr)
         return 1
-    rows = response["result"] or []
+    result = response["result"]
+    if ns.count:
+        payload = result if isinstance(result, dict) else {"count": len(result or [])}
+        _emit(payload, ns,
+              text_renderer=lambda r, o: o.write(f"{r.get('count', 0)} types\n"))
+        return 0
+    rows = result or []
 
     def _render(rows, out):
         for r in rows:
@@ -1239,6 +1742,9 @@ def cmd_types_declare(ns: argparse.Namespace) -> int:
                  "(blank and #-prefixed lines ignored)"),
         arg("--context", type=int, default=0,
             help="Include N previous and N next instructions around each call"),
+        arg("--caller-static", action="store_true",
+            help="Caller_static-first text output: lead with each call's static "
+                 "return address (for mapping a stack return address to its callsite)"),
     ],
 )
 def cmd_callsites(ns: argparse.Namespace) -> int:
@@ -1284,7 +1790,493 @@ def cmd_callsites(ns: argparse.Namespace) -> int:
             for nxt in s.get("next_ins", []) or []:
                 out.write(f"    +  {nxt['address']:>12}  {nxt.get('disasm') or ''}\n")
 
-    _emit(r, ns, text_renderer=_render)
+    def _render_caller_static(r, out):
+        callee = r["callee"]
+        out.write(f"callee  {callee['name']} @ {callee['address']}\n")
+        for s in r.get("callsites", []):
+            cs = s.get("caller_static") or s.get("return_address") or "-"
+            caller = s.get("caller") or "-"
+            out.write(
+                f"  caller_static={cs:<12}  call={s['call_addr']:<12}  "
+                f"{caller:<32}  {s.get('disasm') or ''}\n"
+            )
+
+    renderer = _render_caller_static if ns.caller_static else _render
+    _emit(r, ns, text_renderer=renderer)
+    return 0
+
+
+@command(
+    "dataflow", "callgraph",
+    help="Resolved direct callees/callers (BFS to --depth)",
+    fmt="json", target=True,
+    args=[
+        arg("identifier", help="Function name or entry address"),
+        arg("--direction", choices=("callees", "callers", "both"), default="both"),
+        arg("--depth", type=int, default=1, help="Transitive depth 1..5 (default: 1)"),
+    ],
+)
+def cmd_dataflow_callgraph(ns: argparse.Namespace) -> int:
+    try:
+        response = _send("dataflow_callgraph", ns, identifier=ns.identifier,
+                         direction=ns.direction, depth=ns.depth)
+    except BridgeError as exc:
+        print(f"ghx dataflow callgraph: {exc}", file=sys.stderr)
+        return 1
+
+    def _render(r, out):
+        fn = r.get("function", {})
+        out.write(f"// {fn.get('name')} @ {fn.get('address')}  (depth={r.get('depth')})\n")
+        if "callees" in r:
+            ind = r.get("indirect_callsites", 0)
+            extra = f", {ind} indirect/unresolved" if ind else ""
+            out.write(f"callees  ({len(r['callees'])}{extra})\n")
+            for n in r["callees"]:
+                ext = " (ext)" if n.get("is_external") else ""
+                sites = f"  @ {', '.join(n.get('call_sites', []))}" if n.get("level") == 1 else f"  via {n.get('via')}"
+                out.write(f"  L{n.get('level')}  {n.get('name')}{ext}  {n.get('address')}{sites}\n")
+        if "callers" in r:
+            out.write(f"callers  ({len(r['callers'])})\n")
+            for n in r["callers"]:
+                ext = " (ext)" if n.get("is_external") else ""
+                sites = f"  @ {', '.join(n.get('call_sites', []))}" if n.get("level") == 1 else f"  via {n.get('via')}"
+                out.write(f"  L{n.get('level')}  {n.get('name')}{ext}  {n.get('address')}{sites}\n")
+
+    _emit(response["result"], ns, text_renderer=_render)
+    return 0
+
+
+@command(
+    "dataflow", "values",
+    help="Proven constant register values at an address (SymbolicPropogator)",
+    fmt="json", target=True,
+    args=[
+        arg("identifier", help="Function name or entry address"),
+        arg("address", help="Address within the function to query"),
+        arg("--register", default=None, help="Restrict to one register (default: all base registers)"),
+        arg("--no-frame", action="store_true",
+            help="Drop stack/frame/link/pc registers (sp, fp, lr, pc, ...) to raise signal"),
+    ],
+)
+def cmd_dataflow_values(ns: argparse.Namespace) -> int:
+    try:
+        response = _send("dataflow_values", ns, identifier=ns.identifier,
+                         address=ns.address, register=ns.register,
+                         no_frame=ns.no_frame or None)
+    except BridgeError as exc:
+        print(f"ghx dataflow values: {exc}", file=sys.stderr)
+        return 1
+
+    def _render(r, out):
+        fn = r.get("function", {})
+        out.write(
+            f"// {fn.get('name')} @ {fn.get('address')}  at {r.get('address')}  "
+            f"({r.get('value_count', 0)} resolved constants)\n"
+        )
+        for v in r.get("values", []):
+            rep = f"  ({v['repr']})" if v.get("repr") else ""
+            out.write(f"  {v['register']:<8}  = {v.get('value')}{rep}\n")
+        if not r.get("values"):
+            out.write("  (no constants proven at this address)\n")
+
+    _emit(response["result"], ns, text_renderer=_render)
+    return 0
+
+
+@command(
+    "dataflow", "defuse",
+    help="SSA definition site and use sites of a function variable",
+    fmt="json", target=True,
+    args=[
+        arg("identifier", help="Function name or entry address"),
+        arg("variable", help="Variable/parameter name (see `ghx local list`)"),
+    ],
+)
+def cmd_dataflow_defuse(ns: argparse.Namespace) -> int:
+    try:
+        response = _send("dataflow_defuse", ns, identifier=ns.identifier,
+                         variable=ns.variable)
+    except BridgeError as exc:
+        print(f"ghx dataflow defuse: {exc}", file=sys.stderr)
+        return 1
+
+    def _render(r, out):
+        fn = r.get("function", {})
+        out.write(
+            f"// {fn.get('name')} @ {fn.get('address')}  "
+            f"variable={r.get('variable')} : {r.get('type') or '?'}  "
+            f"({r.get('instance_count', 0)} SSA instances)\n"
+        )
+        for i, inst in enumerate(r.get("instances", [])):
+            d = inst.get("definition")
+            def_s = f"{d.get('address')} {d.get('op')}" if d else "<input/undefined>"
+            out.write(f"  [{i}]  def: {def_s}   uses: {inst.get('use_count', 0)}\n")
+            for u in inst.get("uses", []):
+                out.write(f"         use  {u.get('address')}  {u.get('op')}\n")
+
+    _emit(response["result"], ns, text_renderer=_render)
+    return 0
+
+
+def _render_backward_slice(r, out):
+    fn = r.get("function", {})
+    start = r.get("start", {})
+    if start.get("kind") == "call_arg":
+        where = f"arg {start.get('arg')} of call @ {start.get('address')}"
+    else:
+        where = f"variable {start.get('variable')}"
+    out.write(
+        f"// {fn.get('name')} @ {fn.get('address')}  backward slice of {where}  "
+        f"({r.get('slice_len', 0)} ops, {r.get('origin_count', 0)} origins"
+        f"{', TRUNCATED' if r.get('truncated') else ''})\n"
+    )
+    out.write("origins:\n")
+    for o in r.get("origins", []):
+        kind = o.get("kind")
+        if kind == "const":
+            out.write(f"  const   {o.get('value')}\n")
+        elif kind == "parameter":
+            out.write(f"  param   {o.get('name')}\n")
+        elif kind == "global":
+            out.write(f"  global  {o.get('name')}\n")
+        elif kind == "call_result":
+            out.write(f"  call    {o.get('callee') or '<indirect>'} @ {o.get('address')}\n")
+        elif kind == "load":
+            out.write(f"  load    @ {o.get('address')}\n")
+        else:
+            vn = o.get("varnode", {})
+            out.write(f"  input   {o.get('name') or vn.get('register') or vn.get('kind')}\n")
+    ip = r.get("interprocedural_origins")
+    if r.get("interprocedural"):
+        out.write(f"interprocedural origins ({r.get('interprocedural_origin_count', 0)}):\n")
+        for o in ip or []:
+            kind = o.get("kind")
+            label = (
+                o.get("value") if kind == "const"
+                else o.get("name") if kind in ("parameter", "global")
+                else (o.get("callee") or "<indirect>") if kind == "call_result"
+                else o.get("address") if kind == "load"
+                else o.get("name") or o.get("varnode", {}).get("register") or "?"
+            )
+            path = " -> ".join(o.get("path", []))
+            out.write(f"  {kind:<8} {label}   [{path}]\n")
+
+
+def _send_taint_backward(ns: argparse.Namespace, label: str) -> int:
+    try:
+        response = _send(
+            "taint_backward", ns,
+            identifier=ns.identifier,
+            address=getattr(ns, "at", None),
+            arg=getattr(ns, "arg", None),
+            variable=getattr(ns, "variable", None),
+            max_steps=getattr(ns, "max_depth", None),
+            interprocedural=getattr(ns, "interprocedural", False) or None,
+            ip_depth=getattr(ns, "ip_depth", None),
+        )
+    except BridgeError as exc:
+        print(f"ghx {label}: {exc}", file=sys.stderr)
+        return 1
+    _emit(response["result"], ns, text_renderer=_render_backward_slice)
+    return 0
+
+
+@command(
+    "taint", "forward",
+    help="Forward taint: source->sink chains (return-value + out-buffer; "
+         "--interprocedural follows params across calls)",
+    fmt="json", target=True,
+    args=[
+        arg("--sources", default=None,
+            help="Comma list of source function names (default: libc input fns)"),
+        arg("--sinks", default=None,
+            help="Comma list of sink function names (default: libc danger fns)"),
+        arg("--function", default=None,
+            help="Restrict the scan to one function (faster)"),
+        arg("--interprocedural", action="store_true",
+            help="Follow a sink arg that comes from a parameter up the call "
+                 "graph to a source in an ancestor frame"),
+        arg("--ip-depth", type=int, default=None,
+            help="Max caller frames to cross with --interprocedural (default: 3)"),
+    ],
+)
+def cmd_taint_forward(ns: argparse.Namespace) -> int:
+    try:
+        response = _send("taint_forward", ns, sources=ns.sources, sinks=ns.sinks,
+                         function=ns.function,
+                         interprocedural=ns.interprocedural or None,
+                         ip_depth=ns.ip_depth)
+    except BridgeError as exc:
+        print(f"ghx taint forward: {exc}", file=sys.stderr)
+        return 1
+
+    def _render(r, out):
+        out.write(
+            f"taint forward  ({r.get('chain_count', 0)} chains, "
+            f"{r.get('scanned_functions', 0)} functions scanned)\n"
+        )
+        for c in r.get("chains", []):
+            fn = c.get("function", {})
+            trunc = "  [truncated]" if c.get("truncated") else ""
+            via = c.get("via", "")
+            tag = f" via {via}" if via else ""
+            if c.get("interprocedural"):
+                tag += f" [interproc d={c.get('ip_depth')}]"
+            out.write(
+                f"  {c.get('source')} @ {c.get('source_at')}  ->  "
+                f"{c.get('sink')}(arg{c.get('arg')}) @ {c.get('sink_at')}  "
+                f"in {fn.get('name')}{tag}{trunc}\n"
+            )
+            if c.get("path"):
+                out.write(f"      path: {' -> '.join(c['path'])}\n")
+        if not r.get("chains"):
+            out.write("  (no source->sink chains found)\n")
+
+    _emit(response["result"], ns, text_renderer=_render)
+    return 0
+
+
+@command(
+    "taint", "backward",
+    help="Backward taint: slice a sink argument (or variable) to its origins",
+    fmt="json", target=True,
+    args=[
+        arg("identifier", help="Function name or entry address (the sink's function)"),
+        arg("--at", default=None, help="Call/sink address to slice an argument of"),
+        arg("--arg", type=int, default=None, help="0-based argument index at --at"),
+        arg("--variable", default=None, help="Slice a named variable instead of a call arg"),
+        arg("--max-depth", type=int, default=None,
+            help="Max SSA slice steps before truncation (default: 400)"),
+        arg("--interprocedural", action="store_true",
+            help="Continue the slice into callers when it reaches a parameter"),
+        arg("--ip-depth", type=int, default=None,
+            help="Max caller frames to cross with --interprocedural (default: 3)"),
+    ],
+)
+def cmd_taint_backward(ns: argparse.Namespace) -> int:
+    return _send_taint_backward(ns, "taint backward")
+
+
+@command(
+    "trace",
+    help="Backward slice a call argument through SSA use-def chains to its origin",
+    fmt="json", target=True,
+    args=[
+        arg("identifier", help="Function name or entry address containing the call"),
+        arg("--at", required=True, help="Call address"),
+        arg("--arg", type=int, default=0, help="0-based argument index (default: 0)"),
+        arg("--max-depth", type=int, default=None,
+            help="Max SSA slice steps before truncation (default: 400)"),
+        arg("--interprocedural", action="store_true",
+            help="Continue the slice into callers when it reaches a parameter"),
+        arg("--ip-depth", type=int, default=None,
+            help="Max caller frames to cross with --interprocedural (default: 3)"),
+    ],
+)
+def cmd_trace(ns: argparse.Namespace) -> int:
+    ns.variable = None
+    return _send_taint_backward(ns, "trace")
+
+
+@command(
+    "evidence", "xrefs",
+    help="Xrefs with section/symbol/disassembly context",
+    fmt="json", target=True, paged=True,
+    args=[arg("identifier", help="Address, symbol, or function to cross-reference")],
+)
+def cmd_evidence_xrefs(ns: argparse.Namespace) -> int:
+    try:
+        response = _send("evidence_xrefs", ns, identifier=ns.identifier,
+                         offset=ns.offset, limit=ns.limit)
+    except BridgeError as exc:
+        print(f"ghx evidence xrefs: {exc}", file=sys.stderr)
+        return 1
+
+    def _render(r, out):
+        sect = r.get("target_section")
+        sym = r.get("target_symbol")
+        suffix = f"  [{sect}]" if sect else ""
+        suffix += f"  {sym}" if sym else ""
+        out.write(f"target  {r.get('target')}{suffix}\n")
+        inc = r.get("incoming", [])
+        total = r.get("incoming_total")
+        shown = f"{len(inc)} of {total}" if total is not None and total != len(inc) else str(len(inc))
+        out.write(f"incoming  ({shown})\n")
+        for ref in inc:
+            fn = ref.get("function") or "-"
+            sec = ref.get("section") or "-"
+            kind = "call" if ref.get("is_call") else ref.get("ref_type", "")
+            out.write(
+                f"  {ref.get('address'):>12}  [{sec:<10}]  {fn:<28}  "
+                f"{kind}  {ref.get('disasm') or ''}\n"
+            )
+        outg = r.get("outgoing", [])
+        if outg:
+            out.write(f"outgoing  ({len(outg)})\n")
+            for ref in outg:
+                sec = ref.get("section") or "-"
+                sym = ref.get("symbol") or "-"
+                out.write(
+                    f"  {ref.get('address'):>12}  [{sec:<10}]  {sym:<28}  "
+                    f"{ref.get('ref_type', '')}\n"
+                )
+
+    _emit(response["result"], ns, text_renderer=_render)
+    return 0
+
+
+@command(
+    "evidence", "function",
+    help="Function evidence: thunk, outgoing calls, IL volume, arg hints",
+    fmt="json", target=True,
+    args=[
+        arg("identifier", help="Function name or entry address"),
+        arg("--context", type=int, default=0,
+            help="Disassembly instructions to include around each call (bn parity)"),
+    ],
+)
+def cmd_evidence_function(ns: argparse.Namespace) -> int:
+    try:
+        response = _send("evidence_function", ns, identifier=ns.identifier,
+                         context=ns.context or None)
+    except BridgeError as exc:
+        print(f"ghx evidence function: {exc}", file=sys.stderr)
+        return 1
+
+    def _render(r, out):
+        fn = r.get("function", {})
+        out.write(f"function    {fn.get('name')} @ {fn.get('address')}  [{r.get('section') or '?'}]\n")
+        out.write(f"prototype   {r.get('prototype', '?')}\n")
+        out.write(f"conv        {r.get('calling_convention') or '?'}\n")
+        flags = []
+        if r.get("is_thunk"):
+            flags.append("thunk")
+        if r.get("is_external"):
+            flags.append("external")
+        if flags:
+            out.write(f"flags       {', '.join(flags)}\n")
+        if r.get("thunked"):
+            t = r["thunked"]
+            out.write(f"thunked     {t.get('name')} @ {t.get('address')}\n")
+        out.write(
+            f"size        {r.get('instruction_count', 0)} insns, "
+            f"{r.get('incoming_xref_count', 0)} xrefs in\n"
+        )
+        out.write(f"arg_hints   ({len(r.get('arg_hints', []))})\n")
+        for a in r.get("arg_hints", []):
+            out.write(f"  {a.get('type')} {a.get('name')}  [{a.get('storage') or '?'}]\n")
+        out.write(f"calls       ({r.get('call_count', 0)})\n")
+        for c in r.get("calls", []):
+            tgt = c.get("target") or "-"
+            ext = " (ext)" if c.get("is_external") else ""
+            out.write(f"  {c.get('call_addr'):>12}  -> {tgt}{ext}  @ {c.get('target_addr')}\n")
+
+    _emit(response["result"], ns, text_renderer=_render)
+    return 0
+
+
+@command(
+    "evidence", "init",
+    help="Summarize ctor/dtor pointer sections (.init_array/.fini_array/.ctors)",
+    fmt="json", target=True,
+    args=[
+        arg("--limit", type=int, default=None,
+            help="Cap the entries listed per section (full count still reported)"),
+    ],
+)
+def cmd_evidence_init(ns: argparse.Namespace) -> int:
+    try:
+        response = _send("evidence_init", ns, limit=ns.limit)
+    except BridgeError as exc:
+        print(f"ghx evidence init: {exc}", file=sys.stderr)
+        return 1
+
+    def _render(r, out):
+        secs = r.get("sections", [])
+        if not secs:
+            out.write("(no init/fini/ctor/dtor sections found)\n")
+            return
+        for s in secs:
+            extra = f", showing {s['shown']}" if s.get("truncated") else ""
+            out.write(f"{s['name']}  @ {s['start']}  ({s['count']} entries{extra})\n")
+            for e in s.get("entries", []):
+                tgt = e.get("target") or f"<{e.get('kind')}>"
+                out.write(f"  {e['slot']:>12}  -> {e.get('value')}  {tgt}\n")
+
+    _emit(response["result"], ns, text_renderer=_render)
+    return 0
+
+
+@command(
+    "evidence", "table",
+    help="Interpret memory as a pointer table / vtable",
+    fmt="json", target=True,
+    args=[
+        arg("address", help="Table start address (hex 0x.. or symbol)"),
+        arg("-n", "--count", "--entries", type=int, default=16, dest="count",
+            help="Max pointer slots to read (default: 16; --entries is the bn name)"),
+        arg("--stride", type=int, default=None,
+            help="Byte stride between entries (default: target pointer size)"),
+        arg("--no-stop", action="store_true",
+            help="Don't stop at the first unmapped slot"),
+    ],
+)
+def cmd_evidence_table(ns: argparse.Namespace) -> int:
+    try:
+        response = _send("evidence_table", ns, address=ns.address,
+                         count=ns.count, stride=ns.stride,
+                         stop_on_unmapped=not ns.no_stop)
+    except BridgeError as exc:
+        print(f"ghx evidence table: {exc}", file=sys.stderr)
+        return 1
+
+    def _render(r, out):
+        vt = "  (looks like a vtable)" if r.get("looks_like_vtable") else ""
+        out.write(
+            f"table @ {r.get('address')}  ({r.get('count')} slots, "
+            f"{r.get('function_slots')} functions){vt}\n"
+        )
+        for e in r.get("entries", []):
+            tgt = e.get("target") or f"<{e.get('kind')}>"
+            out.write(f"  [{e.get('index'):>3}]  {e['slot']:>12}  -> {e.get('value')}  {tgt}\n")
+
+    _emit(response["result"], ns, text_renderer=_render)
+    return 0
+
+
+@command(
+    "evidence", "message",
+    help="Type-name/message strings (RTTI, protobuf) with xrefs and section",
+    fmt="json", target=True,
+    args=[
+        arg("--query", default=None,
+            help="Match strings by substring (default: type-name heuristic)"),
+        arg("--regex", action="store_true", help="Treat --query as a regex"),
+        arg("--limit", type=int, default=None, help="Max matches (default: 50)"),
+    ],
+)
+def cmd_evidence_message(ns: argparse.Namespace) -> int:
+    try:
+        response = _send("evidence_message", ns, query=ns.query, regex=ns.regex,
+                         limit=ns.limit)
+    except BridgeError as exc:
+        print(f"ghx evidence message: {exc}", file=sys.stderr)
+        return 1
+
+    def _render(r, out):
+        matches = r.get("matches", [])
+        out.write(f"matches  ({r.get('match_count', 0)}{'+' if r.get('truncated') else ''})\n")
+        for m in matches:
+            sec = m.get("section") or "-"
+            out.write(
+                f"  {m.get('address'):>12}  [{sec:<10}]  "
+                f"{m.get('xref_count', 0)} xref  {m.get('value')}\n"
+            )
+            for x in m.get("xrefs", []):
+                fn = x.get("function") or "-"
+                out.write(f"      <- {x.get('from')}  {fn}\n")
+
+    _emit(response["result"], ns, text_renderer=_render)
     return 0
 
 
@@ -1336,6 +2328,22 @@ def cmd_symbol_rename(ns: argparse.Namespace) -> int:
     return 0
 
 
+@command(
+    "rename", help="Rename a function or data symbol (alias for `symbol rename`)",
+    fmt="json", target=True,
+    args=[
+        arg("--kind", choices=("auto", "function", "data"), default="auto",
+            help="Restrict to function symbols, data symbols, or auto-detect"),
+        arg("--preview", action="store_true",
+            help="Apply, capture diff, and roll back the transaction"),
+        arg("identifier", help="Symbol name or hex address to rename"),
+        arg("new_name", help="New symbol name"),
+    ],
+)
+def cmd_rename(ns: argparse.Namespace) -> int:
+    return cmd_symbol_rename(ns)
+
+
 def _resolve_comment_address(ns: argparse.Namespace) -> str:
     """Pick the target address: --address wins, else --function.entry."""
     if getattr(ns, "address", None):
@@ -1344,7 +2352,7 @@ def _resolve_comment_address(ns: argparse.Namespace) -> str:
     if not func:
         raise BridgeError("comment: pass --address or --function")
     info = send_request("function_info", params={"identifier": func},
-                        target=getattr(ns, "target", None),
+                        target=_resolved_target(ns),
                         instance_id=getattr(ns, "instance", None))
     return str(info["result"]["function"]["address"])
 
@@ -1432,13 +2440,17 @@ def cmd_comment_delete(ns: argparse.Namespace) -> int:
 @command(
     "comment", "list", help="List comments",
     target=True, paged=True,
-    args=[arg("--kinds", default=None,
-              help="Comma-separated kinds to include (default: all)")],
+    args=[
+        arg("--kinds", default=None,
+            help="Comma-separated kinds to include (default: all)"),
+        arg("--query", default=None,
+            help="Filter comments by substring (case-insensitive), like bn"),
+    ],
 )
 def cmd_comment_list(ns: argparse.Namespace) -> int:
     kinds = ns.kinds.split(",") if ns.kinds else None
     try:
-        response = _send("list_comments", ns, kinds=kinds)
+        response = _send("list_comments", ns, kinds=kinds, query=ns.query)
     except BridgeError as exc:
         print(f"ghx comment list: {exc}", file=sys.stderr)
         return 1
@@ -1515,7 +2527,8 @@ def cmd_local_list(ns: argparse.Namespace) -> int:
         for lv in r.get("locals", []):
             tag = "param" if lv.get("is_parameter") else "local"
             out.write(
-                f"  [{tag}]  {lv['type']:<20}  {lv['name']:<24}  [{lv.get('storage') or '?'}]\n"
+                f"  [{tag}]  id={lv.get('id') or '?':<14}  {lv['type']:<20}  "
+                f"{lv['name']:<24}  [{lv.get('storage') or '?'}]\n"
             )
 
     _emit(r, ns, text_renderer=_render)
@@ -1528,7 +2541,7 @@ def cmd_local_list(ns: argparse.Namespace) -> int:
     args=[
         arg("--preview", action="store_true"),
         arg("function", help="Function name or hex address"),
-        arg("variable", help="Existing local name"),
+        arg("variable", help="Existing local name or stable id (see `local list`)"),
         arg("new_name", help="New local name"),
     ],
 )
@@ -1552,7 +2565,7 @@ def cmd_local_rename(ns: argparse.Namespace) -> int:
     args=[
         arg("--preview", action="store_true"),
         arg("function", help="Function name or hex address"),
-        arg("variable", help="Existing local name"),
+        arg("variable", help="Existing local name or stable id (see `local list`)"),
         arg("new_type", help="Target data type (e.g. 'char *', 'int[4]')"),
     ],
 )

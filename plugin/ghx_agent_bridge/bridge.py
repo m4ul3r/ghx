@@ -12,6 +12,7 @@ import signal
 import socketserver
 import sys
 import threading
+import time
 import traceback
 import weakref
 from dataclasses import dataclass, field
@@ -116,6 +117,18 @@ READ_LOCKED_OPS: set[str] = {
     "get_prototype",
     "list_locals",
     "bundle_function",
+    "read_bytes",
+    "structured_il",
+    "evidence_xrefs",
+    "evidence_function",
+    "evidence_init",
+    "evidence_table",
+    "evidence_message",
+    "dataflow_defuse",
+    "dataflow_callgraph",
+    "dataflow_values",
+    "taint_backward",
+    "taint_forward",
 }
 
 WRITE_LOCKED_OPS: set[str] = {
@@ -123,6 +136,7 @@ WRITE_LOCKED_OPS: set[str] = {
     "close_binary",
     "save_database",
     "refresh",
+    "create_function",
     "rename_symbol",
     "set_comment",
     "delete_comment",
@@ -155,7 +169,7 @@ class ProgramHandle:
     program: Any = field(repr=False)
     consumer: Any = field(repr=False)
 
-    def describe(self) -> dict[str, Any]:
+    def describe(self, verbose: bool = False) -> dict[str, Any]:
         prog = self.program
         try:
             language = str(prog.getLanguage().getLanguageID())
@@ -169,7 +183,7 @@ class ProgramHandle:
         except Exception:
             size = 0
         entry_off = _program_entry_offset(prog)
-        return {
+        info: dict[str, Any] = {
             "program_id": self.program_id,
             "basename": self.basename,
             "filename": self.filename,
@@ -182,6 +196,28 @@ class ProgramHandle:
             "size": size,
             "entry": f"0x{entry_off:x}" if entry_off is not None else None,
         }
+        if verbose:
+            # bn's `target info --verbose` adds the segment map (r/w/x ranges).
+            segments: list[dict[str, Any]] = []
+            try:
+                for b in prog.getMemory().getBlocks():
+                    perms = (
+                        ("r" if b.isRead() else "-")
+                        + ("w" if b.isWrite() else "-")
+                        + ("x" if b.isExecute() else "-")
+                    )
+                    segments.append({
+                        "name": str(b.getName()),
+                        "start": f"0x{int(b.getStart().getOffset()):x}",
+                        "end": f"0x{int(b.getEnd().getOffset()):x}",
+                        "size": int(b.getSize()),
+                        "perms": perms,
+                        "initialized": bool(b.isInitialized()),
+                    })
+            except Exception:
+                pass
+            info["segments"] = segments
+        return info
 
 
 class TargetManager:
@@ -193,7 +229,7 @@ class TargetManager:
 
     # ---- lifecycle ------------------------------------------------------
 
-    def load_binary(self, path: str) -> ProgramHandle:
+    def load_binary(self, path: str, quick: bool = False) -> ProgramHandle:
         import pyghidra
         from java.io import File  # type: ignore
         from java.lang import Object  # type: ignore
@@ -237,15 +273,16 @@ class TargetManager:
             with contextlib.suppress(Exception):
                 load_results.close()
 
-        try:
-            pyghidra.analyze(program)
-        except Exception as exc:
-            with contextlib.suppress(Exception):
-                program.release(consumer)
-            raise OperationFailure(
-                "analysis_failed",
-                f"auto-analysis failed for {src.name}: {exc}",
-            ) from exc
+        if not quick:
+            try:
+                pyghidra.analyze(program)
+            except Exception as exc:
+                with contextlib.suppress(Exception):
+                    program.release(consumer)
+                raise OperationFailure(
+                    "analysis_failed",
+                    f"auto-analysis failed for {src.name}: {exc}",
+                ) from exc
 
         # Persist analysis results back into the project.
         with contextlib.suppress(Exception):
@@ -279,14 +316,19 @@ class TargetManager:
             handle.program.release(handle.consumer)
         return {"program_id": handle.program_id, "closed": True}
 
-    def close_all(self) -> None:
+    def close_all(self) -> dict[str, Any]:
+        """Release every loaded program. Used both by the `close --all` op and
+        by daemon shutdown (which ignores the return value)."""
         with self._lock:
             handles = list(self._handles.values())
             self._handles.clear()
             self._active = None
+        closed: list[str] = []
         for h in handles:
             with contextlib.suppress(Exception):
                 h.program.release(h.consumer)
+            closed.append(h.program_id)
+        return {"closed": closed, "count": len(closed)}
 
     # ---- resolution -----------------------------------------------------
 
@@ -422,6 +464,10 @@ class GhxBridge:
         self._thread: threading.Thread | None = None
         self._target_lock = _ReadWriteLock()
         self._shutdown_event = threading.Event()
+        self._started_at: str | None = None
+        self._last_active: str | None = None
+        self._last_registry_write = 0.0
+        self._registry_lock = threading.Lock()
 
     # ---- lifecycle ------------------------------------------------------
 
@@ -455,6 +501,9 @@ class GhxBridge:
     def _write_registry(self) -> None:
         ghidra_version = _read_ghidra_version(self.install_dir)
 
+        if self._started_at is None:
+            self._started_at = datetime.now(timezone.utc).isoformat()
+
         payload: dict[str, Any] = {
             "pid": os.getpid(),
             "socket_path": str(self.socket_path),
@@ -465,11 +514,25 @@ class GhxBridge:
             "ghidra_install_dir": str(self.install_dir),
             "project_path": str(self.project_path),
             "project_name": self.project_name,
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": self._started_at,
+            "last_active": self._last_active or self._started_at,
         }
         if self.instance_id is not None:
             payload["instance_id"] = self.instance_id
         self.registry_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def _touch_activity(self) -> None:
+        """Record request activity; persist `last_active` to the registry at
+        most every 15s so `instance prune --idle` has a real idle metric."""
+        self._last_active = datetime.now(timezone.utc).isoformat()
+        if time.monotonic() - self._last_registry_write < 15.0:
+            return
+        with self._registry_lock:
+            if time.monotonic() - self._last_registry_write < 15.0:
+                return
+            self._last_registry_write = time.monotonic()
+            with contextlib.suppress(Exception):
+                self._write_registry()
 
     # ---- dispatch -------------------------------------------------------
 
@@ -477,6 +540,7 @@ class GhxBridge:
         op = payload.get("op")
         params = payload.get("params") or {}
         target = payload.get("target")
+        self._touch_activity()
         try:
             lock: Any = contextlib.nullcontext()
             if op in WRITE_LOCKED_OPS:
@@ -513,14 +577,17 @@ class GhxBridge:
         if op == "target_info":
             handle = self.targets.resolve(params.get("selector") or target, required=True)
             assert handle is not None
-            return handle.describe()
+            return handle.describe(verbose=bool(params.get("verbose")))
         if op == "load_binary":
             path = params.get("path")
             if not path:
                 raise OperationFailure("bad_request", "load_binary requires 'path'")
-            handle = self.targets.load_binary(str(path))
-            return {"loaded": True, **handle.describe()}
+            quick = bool(params.get("quick", False))
+            handle = self.targets.load_binary(str(path), quick=quick)
+            return {"loaded": True, "analyzed": not quick, **handle.describe()}
         if op == "close_binary":
+            if params.get("all"):
+                return self.targets.close_all()
             return self.targets.close(params.get("selector") or target)
         if op == "decompile":
             return self._op_decompile(params, target)
@@ -534,6 +601,12 @@ class GhxBridge:
             return self._op_il(params, target)
         if op == "disasm":
             return self._op_disasm(params, target)
+        if op == "structured_il":
+            return self._op_structured_il(params, target)
+        if op == "read_bytes":
+            return self._op_read_bytes(params, target)
+        if op == "create_function":
+            return self._op_create_function(params, target)
         if op == "xrefs":
             return self._op_xrefs(params, target)
         if op == "strings":
@@ -578,6 +651,26 @@ class GhxBridge:
             return self._op_struct_field_delete(params, target)
         if op == "callsites":
             return self._op_callsites(params, target)
+        if op == "evidence_xrefs":
+            return self._op_evidence_xrefs(params, target)
+        if op == "evidence_function":
+            return self._op_evidence_function(params, target)
+        if op == "evidence_init":
+            return self._op_evidence_init(params, target)
+        if op == "evidence_table":
+            return self._op_evidence_table(params, target)
+        if op == "evidence_message":
+            return self._op_evidence_message(params, target)
+        if op == "dataflow_defuse":
+            return self._op_dataflow_defuse(params, target)
+        if op == "dataflow_callgraph":
+            return self._op_dataflow_callgraph(params, target)
+        if op == "dataflow_values":
+            return self._op_dataflow_values(params, target)
+        if op == "taint_backward":
+            return self._op_taint_backward(params, target)
+        if op == "taint_forward":
+            return self._op_taint_forward(params, target)
         if op == "field_xrefs":
             return self._op_field_xrefs(params, target)
         if op == "bundle_function":
@@ -670,6 +763,7 @@ class GhxBridge:
         limit = int(params["limit"]) if params.get("limit") is not None else None
         lo_s = params.get("min_address")
         hi_s = params.get("max_address")
+        include_externals = bool(params.get("include_externals"))
         program = handle.program
 
         lo = _parse_address(program, lo_s) if lo_s is not None else None
@@ -685,24 +779,38 @@ class GhxBridge:
                 continue
             if hi is not None and off > hi:
                 continue
+            if not include_externals and _in_external_block(program, entry):
+                continue
             items.append(_func_brief(fn))
-        items.sort(key=lambda row: int(row["address"], 16))
+        _sort_func_rows(items, str(params.get("sort") or "address"))
+        if params.get("count"):
+            return {"count": len(items)}
         if offset:
             items = items[offset:]
         if limit is not None:
             items = items[:limit]
         return items
 
-    def _op_search_functions(self, params: dict[str, Any], target: str | None) -> list[dict[str, Any]]:
+    def _op_search_functions(self, params: dict[str, Any], target: str | None):
         handle = self.targets.resolve(params.get("target") or target, required=True)
         assert handle is not None
         query = str(params.get("query", ""))
         regex = bool(params.get("regex", False))
+        exact = bool(params.get("exact", False))
         offset = int(params.get("offset", 0))
         limit = int(params["limit"]) if params.get("limit") is not None else None
+        include_externals = bool(params.get("include_externals"))
         program = handle.program
 
-        if regex:
+        lo_s = params.get("min_address")
+        hi_s = params.get("max_address")
+        lo = _parse_address(program, lo_s) if lo_s is not None else None
+        hi = _parse_address(program, hi_s) if hi_s is not None else None
+
+        if exact:
+            def matches(name: str) -> bool:
+                return name == query
+        elif regex:
             import re as _re
 
             try:
@@ -721,9 +829,20 @@ class GhxBridge:
         items = []
         for fn in program.getFunctionManager().getFunctions(True):
             name = str(fn.getName())
-            if matches(name):
-                items.append(_func_brief(fn))
-        items.sort(key=lambda row: int(row["address"], 16))
+            if not matches(name):
+                continue
+            entry = fn.getEntryPoint()
+            off = int(entry.getOffset())
+            if lo is not None and off < lo:
+                continue
+            if hi is not None and off > hi:
+                continue
+            if not include_externals and _in_external_block(program, entry):
+                continue
+            items.append(_func_brief(fn))
+        _sort_func_rows(items, str(params.get("sort") or "address"))
+        if params.get("count"):
+            return {"count": len(items)}
         if offset:
             items = items[offset:]
         if limit is not None:
@@ -819,16 +938,21 @@ class GhxBridge:
         if identifier is None:
             raise OperationFailure("bad_request", "il requires 'identifier'")
 
+        raw = bool(params.get("raw", False))
+        show_indirect = bool(params.get("indirect", False))
+
         program = handle.program
         fn = _resolve_function(program, str(identifier))
 
-        lines: list[str] = []
+        # Collect (PcodeOp, address, index) uniformly for both forms, then
+        # derive structured `ops` and the text rendering from one pass.
+        collected: list[tuple[Any, int, int]] = []
         if form == "raw":
             listing = program.getListing()
             for ins in listing.getInstructions(fn.getBody(), True):
                 addr = int(ins.getAddress().getOffset())
-                for op in ins.getPcode():
-                    lines.append(f"{addr:08x}  {op}")
+                for i, op in enumerate(ins.getPcode()):
+                    collected.append((op, addr, i))
         else:
             from ghidra.app.decompiler import DecompInterface, DecompileOptions  # type: ignore
             from ghidra.util.task import TaskMonitor  # type: ignore
@@ -837,7 +961,9 @@ class GhxBridge:
             iface.setOptions(DecompileOptions())
             iface.openProgram(program)
             try:
-                results = iface.decompileFunction(fn, 60, TaskMonitor.DUMMY)
+                results = iface.decompileFunction(
+                    fn, int(params.get("timeout", 60)), TaskMonitor.DUMMY
+                )
                 if not results.decompileCompleted():
                     raise OperationFailure(
                         "decompile_failed",
@@ -850,19 +976,45 @@ class GhxBridge:
                         "decompiler did not produce a high function",
                     )
                 it = high.getPcodeOps()
+                seq = 0
                 while it.hasNext():
                     op = it.next()
                     target_addr = op.getSeqnum().getTarget()
                     off = int(target_addr.getOffset()) if target_addr is not None else 0
-                    lines.append(f"{off:08x}  {op}")
+                    collected.append((op, off, seq))
+                    seq += 1
             finally:
                 with contextlib.suppress(Exception):
                     iface.dispose()
 
+        ops = [_pcode_desc(op, addr, idx, program) for (op, addr, idx) in collected]
+
+        lines: list[str] = []
+        hidden = 0
+        if raw:
+            # Legacy: Ghidra's unformatted PcodeOp.toString (raw varnode tuples).
+            for op, addr, _idx in collected:
+                lines.append(f"{addr:08x}  {op}")
+        else:
+            for desc in ops:
+                if not show_indirect and desc.get("op") == "INDIRECT":
+                    hidden += 1
+                    continue
+                lines.append(f"{int(desc['address'], 16):08x}  {_format_pcode_line(desc)}")
+            if hidden:
+                lines.append(
+                    f"; {hidden} INDIRECT op(s) hidden "
+                    f"(call/store side-effects; --indirect to show)"
+                )
+
         return {
             "function": _func_brief(fn),
             "form": form,
+            "raw": raw,
+            "op_count": len(ops),
+            "hidden_indirect": hidden,
             "text": "\n".join(lines),
+            "ops": ops,
         }
 
     def _op_disasm(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
@@ -898,70 +1050,236 @@ class GhxBridge:
             "instructions": rows,
         }
 
+    def _op_structured_il(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
+        """Per-pcode-op structured IL (op, output, inputs) — the substrate for
+        data-flow/taint tooling. ``form=raw`` emits per-instruction raw p-code;
+        ``form=high`` emits the decompiler's high (SSA) p-code with HighVariable
+        names attached to varnodes where available."""
+        handle = self.targets.resolve(params.get("target") or target, required=True)
+        assert handle is not None
+        identifier = params.get("identifier")
+        form = str(params.get("form", "high")).lower()
+        if form not in ("raw", "high"):
+            raise OperationFailure("bad_request", f"unknown il form: {form!r} (use raw|high)")
+        if identifier is None:
+            raise OperationFailure("bad_request", "structured_il requires 'identifier'")
+        program = handle.program
+        fn = _resolve_function(program, str(identifier))
+
+        ops: list[dict[str, Any]] = []
+        if form == "raw":
+            listing = program.getListing()
+            for ins in listing.getInstructions(fn.getBody(), True):
+                addr = int(ins.getAddress().getOffset())
+                for i, op in enumerate(ins.getPcode()):
+                    ops.append(_pcode_desc(op, addr, i, program))
+        else:
+            from ghidra.app.decompiler import DecompInterface, DecompileOptions  # type: ignore
+            from ghidra.util.task import TaskMonitor  # type: ignore
+
+            iface = DecompInterface()
+            iface.setOptions(DecompileOptions())
+            iface.openProgram(program)
+            try:
+                results = iface.decompileFunction(fn, int(params.get("timeout", 60)), TaskMonitor.DUMMY)
+                if not results.decompileCompleted():
+                    raise OperationFailure(
+                        "decompile_failed",
+                        results.getErrorMessage() or "decompilation did not complete",
+                    )
+                high = results.getHighFunction()
+                if high is None:
+                    raise OperationFailure(
+                        "decompile_failed",
+                        "decompiler did not produce a high function",
+                    )
+                it = high.getPcodeOps()
+                seq = 0
+                while it.hasNext():
+                    op = it.next()
+                    tgt = op.getSeqnum().getTarget()
+                    off = int(tgt.getOffset()) if tgt is not None else 0
+                    ops.append(_pcode_desc(op, off, seq, program))
+                    seq += 1
+            finally:
+                with contextlib.suppress(Exception):
+                    iface.dispose()
+
+        return {
+            "function": _func_brief(fn),
+            "form": form,
+            "op_count": len(ops),
+            "ops": ops,
+        }
+
+    def _op_read_bytes(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
+        """Read raw bytes from program memory at an address. Stops early at an
+        unmapped boundary and reports how many bytes were actually read."""
+        handle = self.targets.resolve(params.get("target") or target, required=True)
+        assert handle is not None
+        program = handle.program
+        addr_s = params.get("address")
+        if addr_s is None:
+            raise OperationFailure("bad_request", "read_bytes requires 'address'")
+        length = int(params.get("length", 16))
+        if length <= 0:
+            raise OperationFailure("bad_request", "length must be positive")
+        if length > 65536:
+            raise OperationFailure("bad_request", "length too large (max 65536 bytes)")
+
+        # Accept a numeric address, or fall back to a symbol/function name
+        # (matching how `xrefs` resolves its identifier).
+        try:
+            off = _parse_address(program, addr_s)
+        except OperationFailure:
+            try:
+                sym, _ = _resolve_symbol(program, str(addr_s))
+                sym_addr = sym.getAddress()
+            except OperationFailure:
+                sym_addr = None
+            if sym_addr is None:
+                raise OperationFailure(
+                    "bad_address", f"could not resolve address or symbol: {addr_s!r}"
+                )
+            off = int(sym_addr.getOffset())
+        base = program.getAddressFactory().getDefaultAddressSpace().getAddress(off)
+        mem = program.getMemory()
+        out = bytearray()
+        for i in range(length):
+            try:
+                b = mem.getByte(base.add(i))
+            except Exception:
+                break
+            out.append(int(b) & 0xFF)
+        ascii_repr = "".join(chr(c) if 32 <= c < 127 else "." for c in out)
+        return {
+            "address": f"0x{off:x}",
+            "length_requested": length,
+            "length_read": len(out),
+            "bytes_hex": out.hex(),
+            "ascii": ascii_repr,
+        }
+
     def _op_xrefs(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
         handle = self.targets.resolve(params.get("target") or target, required=True)
         assert handle is not None
         identifier = params.get("identifier")
         if identifier is None:
             raise OperationFailure("bad_request", "xrefs requires 'identifier'")
+        offset = int(params.get("offset", 0))
+        limit = int(params["limit"]) if params.get("limit") is not None else None
         program = handle.program
-
-        try:
-            off = _parse_address(program, identifier)
-        except Exception:
-            fn = _resolve_function(program, str(identifier))
-            off = int(fn.getEntryPoint().getOffset())
-        addr = program.getAddressFactory().getDefaultAddressSpace().getAddress(off)
 
         fm = program.getFunctionManager()
         rm = program.getReferenceManager()
         listing = program.getListing()
 
+        # Resolve the identifier to one or more target addresses. A raw address
+        # is a single target. A symbol NAME may match several functions (a .plt
+        # thunk AND its EXTERNAL stub) — union references across all of them
+        # instead of raising ambiguous_function, mirroring `_op_callsites` (and
+        # matching `bn xrefs <name>`, which lists callers without complaint).
+        matched_entries: set[int] = set()
+        matched_fns: list[Any] = []
+        try:
+            off = _parse_address(program, identifier)
+            target_addrs = [
+                program.getAddressFactory().getDefaultAddressSpace().getAddress(off)
+            ]
+        except Exception:
+            matched_fns = _resolve_functions(program, str(identifier))
+            if not matched_fns:
+                raise OperationFailure(
+                    "not_found", f"no function matches identifier: {identifier!r}"
+                )
+            target_addrs = [fn.getEntryPoint() for fn in matched_fns]
+            matched_entries = {int(a.getOffset()) for a in target_addrs}
+            off = int(target_addrs[0].getOffset())
+
         code_refs: list[dict[str, Any]] = []
-        for ref in rm.getReferencesTo(addr):
-            from_addr = ref.getFromAddress()
-            from_off = int(from_addr.getOffset())
-            caller = fm.getFunctionContaining(from_addr)
-            ref_type = ref.getReferenceType()
-            ins = listing.getInstructionAt(from_addr)
-            code_refs.append(
-                {
-                    "address": f"0x{from_off:x}",
-                    "function": str(caller.getName()) if caller is not None else None,
-                    "ref_type": str(ref_type),
-                    "is_call": bool(ref_type.isCall()),
-                    "disasm": str(ins) if ins is not None else None,
-                }
-            )
+        seen_from: set[int] = set()
+        for addr in target_addrs:
+            for ref in rm.getReferencesTo(addr):
+                from_addr = ref.getFromAddress()
+                from_off = int(from_addr.getOffset())
+                if from_off in seen_from:
+                    continue
+                caller = fm.getFunctionContaining(from_addr)
+                # Drop a matched thunk's own trampoline branch to its EXTERNAL
+                # stub (the caller is itself one of the unioned targets).
+                if (matched_entries and caller is not None
+                        and int(caller.getEntryPoint().getOffset()) in matched_entries):
+                    continue
+                seen_from.add(from_off)
+                ref_type = ref.getReferenceType()
+                ins = listing.getInstructionAt(from_addr)
+                code_refs.append(
+                    {
+                        "address": f"0x{from_off:x}",
+                        "function": str(caller.getName()) if caller is not None else None,
+                        "ref_type": str(ref_type),
+                        "is_call": bool(ref_type.isCall()),
+                        "disasm": str(ins) if ins is not None else None,
+                    }
+                )
 
         outgoing: list[dict[str, Any]] = []
-        for ref in rm.getReferencesFrom(addr):
-            to = ref.getToAddress()
-            outgoing.append(
-                {
-                    "address": f"0x{int(to.getOffset()):x}",
-                    "ref_type": str(ref.getReferenceType()),
-                }
-            )
+        seen_out: set[tuple[int, str]] = set()
+        for addr in target_addrs:
+            for ref in rm.getReferencesFrom(addr):
+                to = ref.getToAddress()
+                key = (int(to.getOffset()), str(ref.getReferenceType()))
+                if key in seen_out:
+                    continue
+                seen_out.add(key)
+                outgoing.append(
+                    {
+                        "address": f"0x{int(to.getOffset()):x}",
+                        "ref_type": str(ref.getReferenceType()),
+                    }
+                )
 
-        return {
+        code_refs.sort(key=lambda r: int(r["address"], 16))
+        incoming_total = len(code_refs)
+        paged = code_refs[offset:]
+        if limit is not None:
+            paged = paged[:limit]
+
+        result: dict[str, Any] = {
             "target": f"0x{off:x}",
-            "incoming": code_refs,
+            "incoming": paged,
+            "incoming_total": incoming_total,
             "outgoing": outgoing,
         }
+        if len(matched_fns) > 1:
+            # The name matched several thunks/symbols whose refs we unioned.
+            result["matched_targets"] = [_func_brief(c) for c in matched_fns]
+        return result
 
-    def _op_strings(self, params: dict[str, Any], target: str | None) -> list[dict[str, Any]]:
+    def _op_strings(self, params: dict[str, Any], target: str | None):
         from ghidra.program.util import DefinedStringIterator  # type: ignore
 
         handle = self.targets.resolve(params.get("target") or target, required=True)
         assert handle is not None
         query = params.get("query")
-        needle = str(query).lower() if query else None
+        use_regex = bool(params.get("regex"))
+        pattern = None
+        needle = None
+        if query is not None:
+            if use_regex:
+                try:
+                    pattern = re.compile(str(query), re.IGNORECASE)
+                except re.error as exc:
+                    raise ValueError(f"invalid --regex pattern: {exc}")
+            else:
+                needle = str(query).lower()
         section_filter = params.get("section")
         section_needle = str(section_filter) if section_filter else None
+        include_metadata = bool(params.get("include_metadata"))
         min_len = int(params.get("min_length", 1))
         offset = int(params.get("offset", 0))
         limit = int(params["limit"]) if params.get("limit") is not None else None
+        want_count = bool(params.get("count"))
 
         program = handle.program
         memory = program.getMemory()
@@ -975,30 +1293,57 @@ class GhxBridge:
             length = int(data.getLength())
             if length < min_len:
                 continue
-            if needle and needle not in value.lower():
+            # Match against the decoded string content, not Ghidra's C-literal
+            # representation (e.g. `u8"libc.so.6"`), so anchored regexes and
+            # substring queries behave intuitively.
+            content = _decoded_string_value(value)
+            if pattern is not None:
+                if not pattern.search(content):
+                    continue
+            elif needle and needle not in content.lower():
                 continue
             addr = data.getAddress()
             off = int(addr.getOffset())
             block = memory.getBlock(addr)
             section = str(block.getName()) if block is not None else None
+            # Default to the loaded image only. The ELF loader adds file-only
+            # metadata blocks (.shstrtab, .gnu_debuglink, _elfSectionHeaders) in
+            # overlay spaces where isLoaded() is False; bn never reports strings
+            # there. An explicit --section names a block, so honor it regardless.
+            if (not include_metadata and section_needle is None
+                    and block is not None and not block.isLoaded()):
+                continue
             if section_needle and section != section_needle:
                 continue
+            # bn returns the raw decoded string; Ghidra's
+            # getDefaultValueRepresentation() decorates it (`u8"libc.so.6"`).
+            # Expose the decoded content as `value` (parity), carry the original
+            # representation as `repr`, and split out the encoding prefix.
+            encoding = None
+            for pfx in ("u8", "U", "L", "u"):
+                if value.startswith(pfx + '"'):
+                    encoding = pfx
+                    break
             rows.append(
                 {
                     "address": f"0x{off:x}",
                     "length": length,
-                    "value": value,
+                    "value": content,
+                    "repr": value,
+                    "encoding": encoding,
                     "section": section,
                 }
             )
         rows.sort(key=lambda row: int(row["address"], 16))
+        if want_count:
+            return {"count": len(rows)}
         if offset:
             rows = rows[offset:]
         if limit is not None:
             rows = rows[:limit]
         return rows
 
-    def _op_imports(self, params: dict[str, Any], target: str | None) -> list[dict[str, Any]]:
+    def _op_imports(self, params: dict[str, Any], target: str | None):
         handle = self.targets.resolve(params.get("target") or target, required=True)
         assert handle is not None
         program = handle.program
@@ -1017,6 +1362,7 @@ class GhxBridge:
                     "address": f"0x{off:x}",
                     "library": library,
                     "is_thunk": False,
+                    "kind": "external",
                 }
             )
 
@@ -1038,12 +1384,77 @@ class GhxBridge:
                         else None
                     ),
                     "is_thunk": True,
+                    "kind": "thunk",
                 }
             )
+
+        # Imported DATA/object symbols (stderr, stdout, optarg, ...) are not
+        # returned by getExternalSymbols() — Ghidra models them as IMPORTED
+        # Labels in the synthetic EXTERNAL block. bn lists them as imports, so
+        # surface them too (deduped by name against the function externals).
+        seen_names = {r["name"] for r in rows}
+        ext_block = next(
+            (b for b in program.getMemory().getBlocks()
+             if str(b.getName()) == _EXTERNAL_BLOCK_NAME),
+            None,
+        )
+        if ext_block is not None:
+            from ghidra.program.model.address import AddressSet  # type: ignore
+            from ghidra.program.model.symbol import SymbolType  # type: ignore
+
+            st = program.getSymbolTable()
+            fm = program.getFunctionManager()
+            aset = AddressSet(ext_block.getStart(), ext_block.getEnd())
+            it = st.getSymbols(aset, SymbolType.LABEL, True)
+            while it.hasNext():
+                sym = it.next()
+                if str(sym.getSource()) != "IMPORTED":
+                    continue
+                addr = sym.getAddress()
+                if addr is None or fm.getFunctionContaining(addr) is not None:
+                    continue  # a function external, already covered
+                name = str(sym.getName())
+                if name in seen_names:
+                    continue
+                seen_names.add(name)
+                rows.append(
+                    {
+                        "name": name,
+                        "address": f"0x{int(addr.getOffset()):x}",
+                        "library": None,
+                        "is_thunk": False,
+                        "kind": "data",
+                    }
+                )
+
         rows.sort(key=lambda row: (row["name"], int(row["address"], 16)))
+
+        if params.get("summary"):
+            by_library: dict[str, int] = {}
+            by_kind: dict[str, int] = {}
+            for r in rows:
+                lib = r.get("library") or "(none)"
+                by_library[lib] = by_library.get(lib, 0) + 1
+                k = r.get("kind", "external")
+                by_kind[k] = by_kind.get(k, 0) + 1
+            return {
+                "total": len(rows),
+                "by_kind": by_kind,
+                "by_library": dict(
+                    sorted(by_library.items(), key=lambda kv: (-kv[1], kv[0]))
+                ),
+            }
+        if params.get("count"):
+            return {"count": len(rows)}
+        offset = int(params.get("offset", 0))
+        limit = int(params["limit"]) if params.get("limit") is not None else None
+        if offset:
+            rows = rows[offset:]
+        if limit is not None:
+            rows = rows[:limit]
         return rows
 
-    def _op_sections(self, params: dict[str, Any], target: str | None) -> list[dict[str, Any]]:
+    def _op_sections(self, params: dict[str, Any], target: str | None):
         handle = self.targets.resolve(params.get("target") or target, required=True)
         assert handle is not None
         query = params.get("query")
@@ -1071,6 +1482,15 @@ class GhxBridge:
                     "source": str(block.getSourceName()) if block.getSourceName() else None,
                 }
             )
+        rows.sort(key=lambda row: int(row["start"], 16))
+        if params.get("count"):
+            return {"count": len(rows)}
+        offset = int(params.get("offset", 0))
+        limit = int(params["limit"]) if params.get("limit") is not None else None
+        if offset:
+            rows = rows[offset:]
+        if limit is not None:
+            rows = rows[:limit]
         return rows
 
     def _op_types(self, params: dict[str, Any], target: str | None) -> list[dict[str, Any]]:
@@ -1103,6 +1523,8 @@ class GhxBridge:
                 }
             )
         rows.sort(key=lambda row: row["path"].lower())
+        if params.get("count"):
+            return {"count": len(rows)}
         if offset:
             rows = rows[offset:]
         if limit is not None:
@@ -1227,6 +1649,62 @@ class GhxBridge:
             after={"name": str(new_name), "address": before_addr_s, "kind": kind},
         )
 
+    def _op_create_function(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
+        """Create (and let Ghidra body-analyze) a function at an address that
+        auto-analysis missed. Errors if a function already exists there."""
+        from ghidra.app.cmd.function import CreateFunctionCmd  # type: ignore
+        from ghidra.program.model.symbol import SourceType  # type: ignore
+        from ghidra.util.task import TaskMonitor  # type: ignore
+
+        handle = self.targets.resolve(params.get("target") or target, required=True)
+        assert handle is not None
+        program = handle.program
+        addr_s = params.get("address")
+        if addr_s is None:
+            raise OperationFailure("bad_request", "create_function requires 'address'")
+        name = params.get("name")
+        preview = bool(params.get("preview", False))
+
+        off = _parse_address(program, addr_s)
+        entry = program.getAddressFactory().getDefaultAddressSpace().getAddress(off)
+        fm = program.getFunctionManager()
+        existing = fm.getFunctionAt(entry)
+        if existing is not None:
+            raise OperationFailure(
+                "already_exists",
+                f"a function already exists at 0x{off:x}: {existing.getName()}",
+            )
+
+        def _apply() -> None:
+            cmd = CreateFunctionCmd(
+                str(name) if name else None, entry, None, SourceType.USER_DEFINED
+            )
+            if not cmd.applyTo(program, TaskMonitor.DUMMY):
+                raise OperationFailure(
+                    "create_failed",
+                    cmd.getStatusMsg() or f"could not create a function at 0x{off:x}",
+                )
+
+        def _verify() -> tuple[bool, Any]:
+            fn = fm.getFunctionAt(entry)
+            if fn is None:
+                return False, None
+            return True, {
+                "name": str(fn.getName()),
+                "address": f"0x{off:x}",
+                "size": int(fn.getBody().getNumAddresses()),
+            }
+
+        return _run_mutation(
+            program,
+            description=f"ghx:create_function @ 0x{off:x}",
+            apply=_apply,
+            verify=_verify,
+            preview=preview,
+            before={"exists": False, "address": f"0x{off:x}"},
+            after={"exists": True, "name": name, "address": f"0x{off:x}"},
+        )
+
     def _op_set_comment(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
         handle = self.targets.resolve(params.get("target") or target, required=True)
         assert handle is not None
@@ -1334,6 +1812,8 @@ class GhxBridge:
             want = [str(k).lower() for k in kinds]
         else:
             want = ["plate", "pre", "post", "eol", "repeatable"]
+        query = params.get("query")
+        needle = str(query).lower() if query else None
 
         rows: list[dict[str, Any]] = []
         type_map = {
@@ -1352,6 +1832,8 @@ class GhxBridge:
                 addr = it.next()
                 text = listing.getComment(ctype, addr)
                 if text is None:
+                    continue
+                if needle is not None and needle not in str(text).lower():
                     continue
                 rows.append(
                     {
@@ -1465,6 +1947,7 @@ class GhxBridge:
         for p in fn.getParameters():
             rows.append(
                 {
+                    "id": _var_id(p),
                     "name": str(p.getName()),
                     "type": str(p.getDataType().getName()),
                     "storage": _storage_str(p),
@@ -1474,6 +1957,7 @@ class GhxBridge:
         for lv in fn.getLocalVariables():
             rows.append(
                 {
+                    "id": _var_id(lv),
                     "name": str(lv.getName()),
                     "type": str(lv.getDataType().getName()),
                     "storage": _storage_str(lv),
@@ -1772,7 +2256,15 @@ class GhxBridge:
         if identifier is None:
             raise OperationFailure("bad_request", "callsites requires 'identifier'")
 
-        callee = _resolve_function(program, str(identifier))
+        # A libc name usually resolves to BOTH a .plt thunk and the EXTERNAL
+        # symbol; union the real call sites across all of them instead of
+        # erroring with ambiguous_function. The isCall() filter naturally drops
+        # the thunk->external trampoline references.
+        callees = _resolve_functions(program, str(identifier))
+        if not callees:
+            raise OperationFailure(
+                "not_found", f"no function matches identifier: {identifier!r}"
+            )
         fm = program.getFunctionManager()
         listing = program.getListing()
         rm = program.getReferenceManager()
@@ -1781,40 +2273,1126 @@ class GhxBridge:
         if within:
             allowed_callers = {str(w) for w in within}
 
+        # Entry offsets of all matched targets, so we can drop a thunk's own
+        # internal trampoline branch to the EXTERNAL (caller == one of the
+        # matched thunks) rather than report it as a real call site.
+        callee_entries = {int(c.getEntryPoint().getOffset()) for c in callees}
+
         sites: list[dict[str, Any]] = []
-        for ref in rm.getReferencesTo(callee.getEntryPoint()):
-            rtype = ref.getReferenceType()
-            if not rtype.isCall():
-                continue
-            from_addr = ref.getFromAddress()
-            caller = fm.getFunctionContaining(from_addr)
-            caller_name = str(caller.getName()) if caller is not None else None
-            if allowed_callers and caller_name not in allowed_callers:
-                continue
-            ins = listing.getInstructionAt(from_addr)
-            return_addr = None
-            if ins is not None:
-                try:
-                    return_addr = ins.getMaxAddress().add(1)
-                except Exception:
-                    return_addr = None
-            site: dict[str, Any] = {
-                "callee": str(callee.getName()),
-                "caller": caller_name,
-                "call_addr": f"0x{int(from_addr.getOffset()):x}",
-                "return_address": (
+        seen_calls: set[int] = set()
+        for callee in callees:
+            callee_name = str(callee.getName())
+            for ref in rm.getReferencesTo(callee.getEntryPoint()):
+                rtype = ref.getReferenceType()
+                if not rtype.isCall():
+                    continue
+                from_addr = ref.getFromAddress()
+                call_off = int(from_addr.getOffset())
+                if call_off in seen_calls:
+                    continue
+                caller = fm.getFunctionContaining(from_addr)
+                if caller is not None and int(caller.getEntryPoint().getOffset()) in callee_entries:
+                    continue
+                caller_name = str(caller.getName()) if caller is not None else None
+                if allowed_callers and caller_name not in allowed_callers:
+                    continue
+                seen_calls.add(call_off)
+                ins = listing.getInstructionAt(from_addr)
+                return_addr = None
+                if ins is not None:
+                    try:
+                        return_addr = ins.getMaxAddress().add(1)
+                    except Exception:
+                        return_addr = None
+                return_str = (
                     f"0x{int(return_addr.getOffset()):x}" if return_addr is not None else None
-                ),
-                "ref_type": str(rtype),
-                "disasm": str(ins) if ins is not None else None,
-            }
-            if context > 0 and ins is not None:
-                site["prev_ins"] = _surrounding_instructions(listing, ins, -context)
-                site["next_ins"] = _surrounding_instructions(listing, ins, context)
-            sites.append(site)
+                )
+                site: dict[str, Any] = {
+                    "callee": callee_name,
+                    "caller": caller_name,
+                    "call_addr": f"0x{call_off:x}",
+                    "return_address": return_str,
+                    # caller_static: the static return address (instruction after
+                    # the call) used to map a stack return address back here.
+                    "caller_static": return_str,
+                    "ref_type": str(rtype),
+                    "disasm": str(ins) if ins is not None else None,
+                }
+                if context > 0 and ins is not None:
+                    site["prev_ins"] = _surrounding_instructions(listing, ins, -context)
+                    site["next_ins"] = _surrounding_instructions(listing, ins, context)
+                sites.append(site)
 
         sites.sort(key=lambda row: int(row["call_addr"], 16))
-        return {"callee": _func_brief(callee), "callsites": sites}
+        result = {"callee": _func_brief(callees[0]), "callsites": sites}
+        if len(callees) > 1:
+            # Surface that the name matched several thunks/symbols we unioned.
+            result["matched_targets"] = [_func_brief(c) for c in callees]
+        return result
+
+    def _op_evidence_xrefs(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
+        """Xrefs enriched with section/symbol context on top of `_op_xrefs`.
+        Incoming refs already carry the containing function + disassembly; this
+        adds the memory block (section/segment) for every ref and the
+        destination symbol for outgoing refs."""
+        handle = self.targets.resolve(params.get("target") or target, required=True)
+        assert handle is not None
+        program = handle.program
+        base = self._op_xrefs(params, target)
+
+        for ref in base.get("incoming", []):
+            try:
+                off = int(ref["address"], 16)
+            except (KeyError, ValueError, TypeError):
+                continue
+            ref["section"] = _block_name_for(program, off)
+        for ref in base.get("outgoing", []):
+            try:
+                off = int(ref["address"], 16)
+            except (KeyError, ValueError, TypeError):
+                continue
+            ref["section"] = _block_name_for(program, off)
+            ref["symbol"] = _primary_symbol_name(program, off)
+
+        try:
+            toff = int(base["target"], 16)
+            base["target_section"] = _block_name_for(program, toff)
+            base["target_symbol"] = _primary_symbol_name(program, toff)
+        except (KeyError, ValueError, TypeError):
+            pass
+        return base
+
+    def _op_evidence_function(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
+        """Generic function evidence: thunk candidates, outgoing calls,
+        instruction/IL volume, and argument hints — a one-shot triage summary."""
+        handle = self.targets.resolve(params.get("target") or target, required=True)
+        assert handle is not None
+        program = handle.program
+        identifier = params.get("identifier") or params.get("name")
+        if identifier is None:
+            raise OperationFailure("bad_request", "evidence_function requires 'identifier'")
+        fn = _resolve_function(program, str(identifier))
+        context = int(params.get("context", 0))
+        fm = program.getFunctionManager()
+        rm = program.getReferenceManager()
+        listing = program.getListing()
+
+        calls: list[dict[str, Any]] = []
+        instruction_count = 0
+        for ins in listing.getInstructions(fn.getBody(), True):
+            instruction_count += 1
+            for ref in ins.getReferencesFrom():
+                rtype = ref.getReferenceType()
+                if not rtype.isCall():
+                    continue
+                to = ref.getToAddress()
+                callee = fm.getFunctionAt(to) or fm.getFunctionContaining(to)
+                call_entry: dict[str, Any] = {
+                    "call_addr": f"0x{int(ins.getAddress().getOffset()):x}",
+                    "target": str(callee.getName()) if callee is not None else None,
+                    "target_addr": f"0x{int(to.getOffset()):x}",
+                    "is_external": bool(callee.isExternal()) if callee is not None else None,
+                }
+                if context > 0:
+                    # bn's --context: disassembly around each call.
+                    call_entry["prev_ins"] = _surrounding_instructions(
+                        listing, ins, -context)
+                    call_entry["next_ins"] = _surrounding_instructions(
+                        listing, ins, context)
+                calls.append(call_entry)
+
+        arg_hints = [
+            {
+                "name": str(p.getName()),
+                "type": str(p.getDataType().getName()),
+                "storage": _storage_str(p),
+            }
+            for p in fn.getParameters()
+        ]
+
+        result: dict[str, Any] = {
+            "function": _func_brief(fn),
+            "prototype": str(fn.getPrototypeString(True, False)),
+            "calling_convention": (
+                str(fn.getCallingConventionName()) if fn.getCallingConventionName() else None
+            ),
+            "section": _block_name_for(program, int(fn.getEntryPoint().getOffset())),
+            "is_thunk": bool(fn.isThunk()),
+            "is_external": bool(fn.isExternal()),
+            "incoming_xref_count": int(rm.getReferenceCountTo(fn.getEntryPoint())),
+            "instruction_count": instruction_count,
+            "call_count": len(calls),
+            "calls": calls,
+            "arg_hints": arg_hints,
+        }
+        if fn.isThunk():
+            thunked = fn.getThunkedFunction(True)
+            if thunked is not None:
+                result["thunked"] = {
+                    "name": str(thunked.getName()),
+                    "address": f"0x{int(thunked.getEntryPoint().getOffset()):x}",
+                    "is_external": bool(thunked.isExternal()),
+                }
+        return result
+
+    # Section names that hold ctor/dtor function pointers across toolchains.
+    _INIT_SECTION_NAMES = (
+        ".init_array", ".fini_array", ".preinit_array", ".ctors", ".dtors",
+    )
+
+    def _op_evidence_init(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
+        """Summarize constructor/destructor pointer sections (.init_array,
+        .fini_array, .ctors, .dtors): walk each as a pointer array and resolve
+        every slot to a function."""
+        handle = self.targets.resolve(params.get("target") or target, required=True)
+        assert handle is not None
+        program = handle.program
+        ptr_size = int(program.getDefaultPointerSize())
+        wanted = {n.lower() for n in self._INIT_SECTION_NAMES}
+        limit = int(params["limit"]) if params.get("limit") is not None else None
+
+        sections: list[dict[str, Any]] = []
+        for block in program.getMemory().getBlocks():
+            name = str(block.getName())
+            if name.lower() not in wanted:
+                continue
+            start = int(block.getStart().getOffset())
+            size = int(block.getSize())
+            entries: list[dict[str, Any]] = []
+            count = size // ptr_size if ptr_size else 0
+            for i in range(count):
+                slot_off = start + i * ptr_size
+                value = _read_pointer(program, slot_off, ptr_size)
+                if value is None:
+                    continue
+                entry = {"slot": f"0x{slot_off:x}", **_resolve_pointer_target(program, value)}
+                entries.append(entry)
+            full_count = len(entries)
+            truncated = limit is not None and full_count > limit
+            if truncated:
+                entries = entries[:limit]
+            sections.append(
+                {
+                    "name": name,
+                    "start": f"0x{start:x}",
+                    "size": size,
+                    "pointer_size": ptr_size,
+                    "count": full_count,
+                    "shown": len(entries),
+                    "truncated": truncated,
+                    "entries": entries,
+                }
+            )
+        return {"sections": sections, "section_count": len(sections)}
+
+    def _op_evidence_table(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
+        """Interpret memory at an address as a pointer table / vtable: read
+        consecutive pointers and resolve each, stopping at *count* or at the
+        first unmapped slot (unless ``stop_on_unmapped`` is false)."""
+        handle = self.targets.resolve(params.get("target") or target, required=True)
+        assert handle is not None
+        program = handle.program
+        addr_s = params.get("address")
+        if addr_s is None:
+            raise OperationFailure("bad_request", "evidence_table requires 'address'")
+        # `entries` is bn's name for the slot count; keep `count` as the alias.
+        count = int(params.get("entries") or params.get("count") or 16)
+        if count <= 0 or count > 4096:
+            raise OperationFailure("bad_request", "count must be in 1..4096")
+        stop_on_unmapped = bool(params.get("stop_on_unmapped", True))
+        ptr_size = int(params.get("pointer_size", program.getDefaultPointerSize()))
+        # `stride` is the byte spacing between entries (bn parity); defaults to
+        # the pointer size. The value at each slot is still read as a pointer.
+        stride = int(params.get("stride") or ptr_size)
+        if stride <= 0:
+            raise OperationFailure("bad_request", "stride must be positive")
+
+        try:
+            start = _parse_address(program, addr_s)
+        except OperationFailure:
+            sym, _ = _resolve_symbol(program, str(addr_s))
+            sym_addr = sym.getAddress()
+            if sym_addr is None:
+                raise OperationFailure("bad_address", f"could not resolve: {addr_s!r}")
+            start = int(sym_addr.getOffset())
+
+        entries: list[dict[str, Any]] = []
+        for i in range(count):
+            slot_off = start + i * stride
+            value = _read_pointer(program, slot_off, ptr_size)
+            if value is None:
+                break
+            resolved = _resolve_pointer_target(program, value)
+            if stop_on_unmapped and resolved.get("kind") == "unmapped" and i > 0:
+                break
+            entries.append({"slot": f"0x{slot_off:x}", "index": i, **resolved})
+
+        function_slots = sum(1 for e in entries if e.get("kind") == "function")
+        return {
+            "address": f"0x{start:x}",
+            "pointer_size": ptr_size,
+            "stride": stride,
+            "count": len(entries),
+            "function_slots": function_slots,
+            "looks_like_vtable": function_slots >= 2 and function_slots >= len(entries) - 1,
+            "entries": entries,
+        }
+
+    def _op_evidence_message(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
+        """Surface message/type-name strings (C++ RTTI names, protobuf type
+        names, etc.) with their cross-references and section context. With a
+        ``query`` it matches that substring/regex; without one it falls back to
+        a type-name heuristic (contains '::', or a dotted package.Type token)."""
+        from ghidra.program.util import DefinedStringIterator  # type: ignore
+
+        handle = self.targets.resolve(params.get("target") or target, required=True)
+        assert handle is not None
+        program = handle.program
+        query = params.get("query")
+        regex = bool(params.get("regex", False))
+        limit = int(params.get("limit", 50))
+        min_len = int(params.get("min_length", 3))
+
+        if query:
+            if regex:
+                import re as _re
+
+                try:
+                    pattern = _re.compile(str(query))
+                except Exception as exc:  # re.error
+                    raise OperationFailure("invalid_regex", f"invalid regex: {exc}") from exc
+
+                def matcher(value: str) -> bool:
+                    return bool(pattern.search(value))
+            else:
+                needle = str(query).lower()
+
+                def matcher(value: str) -> bool:
+                    return needle in value.lower()
+        else:
+            def matcher(value: str) -> bool:
+                if "::" in value:
+                    return True
+                token = value.strip().strip('"')
+                return (
+                    "." in token
+                    and " " not in token
+                    and len(token) >= 4
+                    and token[:1].isalpha()
+                )
+
+        mem = program.getMemory()
+        rm = program.getReferenceManager()
+        fm = program.getFunctionManager()
+        matches: list[dict[str, Any]] = []
+        for data in DefinedStringIterator.forProgram(program):
+            try:
+                value = str(data.getDefaultValueRepresentation())
+            except Exception:
+                continue
+            if int(data.getLength()) < min_len or not matcher(value):
+                continue
+            addr = data.getAddress()
+            off = int(addr.getOffset())
+            block = mem.getBlock(addr)
+            xrefs: list[dict[str, Any]] = []
+            for ref in rm.getReferencesTo(addr):
+                from_addr = ref.getFromAddress()
+                caller = fm.getFunctionContaining(from_addr)
+                xrefs.append(
+                    {
+                        "from": f"0x{int(from_addr.getOffset()):x}",
+                        "function": str(caller.getName()) if caller is not None else None,
+                        "ref_type": str(ref.getReferenceType()),
+                    }
+                )
+            matches.append(
+                {
+                    "address": f"0x{off:x}",
+                    "value": value,
+                    "length": int(data.getLength()),
+                    "section": str(block.getName()) if block is not None else None,
+                    "xref_count": len(xrefs),
+                    "xrefs": xrefs,
+                }
+            )
+            if len(matches) >= limit:
+                break
+        return {
+            "matches": matches,
+            "match_count": len(matches),
+            "truncated": len(matches) >= limit,
+        }
+
+    # ---- data-flow (Tier A) --------------------------------------------
+
+    @contextlib.contextmanager
+    def _high_function(self, program: Any, fn: Any, timeout: int = 60):
+        """Decompile *fn* and yield its HighFunction (SSA form), disposing the
+        decompiler interface afterwards. Shared substrate for data-flow ops."""
+        from ghidra.app.decompiler import DecompInterface, DecompileOptions  # type: ignore
+        from ghidra.util.task import TaskMonitor  # type: ignore
+
+        iface = DecompInterface()
+        iface.setOptions(DecompileOptions())
+        iface.openProgram(program)
+        try:
+            results = iface.decompileFunction(fn, int(timeout), TaskMonitor.DUMMY)
+            if not results.decompileCompleted():
+                raise OperationFailure(
+                    "decompile_failed",
+                    results.getErrorMessage() or "decompilation did not complete",
+                )
+            high = results.getHighFunction()
+            if high is None:
+                raise OperationFailure(
+                    "decompile_failed", "decompiler did not produce a high function"
+                )
+            yield high
+        finally:
+            with contextlib.suppress(Exception):
+                iface.dispose()
+
+    @staticmethod
+    def _find_high_symbol(high: Any, var_name: str) -> Any:
+        """Locate a HighSymbol by name in a HighFunction's local symbol map."""
+        lsm = high.getLocalSymbolMap()
+        it = lsm.getSymbols()
+        while it.hasNext():
+            sym = it.next()
+            if str(sym.getName()) == var_name:
+                return sym
+        return None
+
+    @staticmethod
+    def _available_var_names(high: Any) -> list[str]:
+        names: set[str] = set()
+        it = high.getLocalSymbolMap().getSymbols()
+        while it.hasNext():
+            names.add(str(it.next().getName()))
+        return sorted(names)
+
+    def _op_dataflow_defuse(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
+        """SSA def/use for a named variable: the definition site and every use
+        site of each SSA instance of the variable, via HighFunction."""
+        handle = self.targets.resolve(params.get("target") or target, required=True)
+        assert handle is not None
+        program = handle.program
+        identifier = params.get("identifier")
+        var_name = params.get("variable")
+        if identifier is None or var_name is None:
+            raise OperationFailure(
+                "bad_request", "dataflow_defuse requires 'identifier' and 'variable'"
+            )
+        fn = _resolve_function(program, str(identifier))
+
+        with self._high_function(program, fn, int(params.get("timeout", 60))) as high:
+            sym = self._find_high_symbol(high, str(var_name))
+            if sym is None:
+                avail = self._available_var_names(high)
+                raise OperationFailure(
+                    "not_found",
+                    f"no variable named {var_name!r}; available: {', '.join(avail[:40])}",
+                )
+            hv = sym.getHighVariable()
+            if hv is None:
+                raise OperationFailure(
+                    "not_found",
+                    f"variable {var_name!r} has no SSA high variable (optimized out?)",
+                )
+            instances: list[dict[str, Any]] = []
+            for vn in hv.getInstances():
+                definition = _high_pcode_desc(vn.getDef(), program)
+                uses: list[dict[str, Any]] = []
+                it = vn.getDescendants()
+                while it.hasNext():
+                    desc = _high_pcode_desc(it.next(), program)
+                    if desc is not None:
+                        uses.append(desc)
+                instances.append(
+                    {
+                        "varnode": _varnode_desc(vn, program),
+                        "definition": definition,
+                        "use_count": len(uses),
+                        "uses": uses,
+                    }
+                )
+            dtype = None
+            try:
+                if hv.getDataType() is not None:
+                    dtype = str(hv.getDataType().getName())
+            except Exception:
+                dtype = None
+            return {
+                "function": _func_brief(fn),
+                "variable": str(var_name),
+                "type": dtype,
+                "instance_count": len(instances),
+                "instances": instances,
+            }
+
+    def _op_dataflow_values(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
+        """Constants resolved at an address via Ghidra's SymbolicPropogator.
+        HONEST SCOPE: this reports proven *constant* register values, not a full
+        value-set (no ranges / multi-value sets — Ghidra has no native VSA)."""
+        from ghidra.app.plugin.core.analysis import ConstantPropagationContextEvaluator  # type: ignore
+        from ghidra.program.util import SymbolicPropogator  # type: ignore
+        from ghidra.util.task import TaskMonitor  # type: ignore
+
+        handle = self.targets.resolve(params.get("target") or target, required=True)
+        assert handle is not None
+        program = handle.program
+        identifier = params.get("identifier")
+        addr_s = params.get("address")
+        reg_name = params.get("register")
+        if identifier is None or addr_s is None:
+            raise OperationFailure(
+                "bad_request", "dataflow_values requires 'identifier' and 'address'"
+            )
+        fn = _resolve_function(program, str(identifier))
+        query_off = _parse_address(program, addr_s)
+        query_addr = program.getAddressFactory().getDefaultAddressSpace().getAddress(query_off)
+        if not fn.getBody().contains(query_addr):
+            raise OperationFailure(
+                "bad_request",
+                f"address 0x{query_off:x} is not inside {fn.getName()}",
+            )
+
+        monitor = TaskMonitor.DUMMY
+        sp = SymbolicPropogator(program)
+        evaluator = ConstantPropagationContextEvaluator(monitor, True)
+        sp.flowConstants(fn.getEntryPoint(), fn.getBody(), evaluator, True, monitor)
+
+        if reg_name:
+            reg = program.getRegister(str(reg_name))
+            if reg is None:
+                raise OperationFailure("not_found", f"unknown register: {reg_name!r}")
+            registers = [reg]
+        else:
+            registers = [r for r in program.getLanguage().getRegisters() if r.isBaseRegister()]
+
+        # Drop stack/frame/link/pc housekeeping registers (only meaningful in the
+        # all-registers case; an explicit --register is always honoured).
+        drop_frame = bool(params.get("no_frame")) and not reg_name
+
+        mask = (1 << (8 * int(program.getDefaultPointerSize()))) - 1
+        values: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for reg in registers:
+            try:
+                val = sp.getRegisterValue(query_addr, reg)
+            except Exception:
+                val = None
+            if val is None:
+                continue
+            name = str(reg.getName())
+            if drop_frame and name.lower() in _FRAME_REGISTER_NAMES:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            try:
+                raw = int(val.getValue())
+            except Exception:
+                continue
+            rep = None
+            with contextlib.suppress(Exception):
+                rep = str(sp.getRegisterValueRepresentation(query_addr, reg))
+            values.append(
+                {
+                    "register": name,
+                    "value": f"0x{raw & mask:x}",
+                    "value_dec": raw,
+                    "repr": rep,
+                }
+            )
+        values.sort(key=lambda x: x["register"])
+        return {
+            "function": _func_brief(fn),
+            "address": f"0x{query_off:x}",
+            "value_count": len(values),
+            "values": values,
+            "note": (
+                "proven constants from Ghidra SymbolicPropogator; not a full "
+                "value-set (single constants only, no ranges/multi-value)"
+            ),
+        }
+
+    @staticmethod
+    def _find_call_op(high: Any, target_off: int) -> Any:
+        """The CALL/CALLIND high-pcode op at *target_off*, or None."""
+        it = high.getPcodeOps()
+        while it.hasNext():
+            op = it.next()
+            tgt = op.getSeqnum().getTarget()
+            if (
+                tgt is not None
+                and int(tgt.getOffset()) == target_off
+                and str(op.getMnemonic()) in ("CALL", "CALLIND")
+            ):
+                return op
+        return None
+
+    @staticmethod
+    def _name_set(value: Any, default: tuple[str, ...]) -> set[str]:
+        """Normalize a source/sink spec (list or comma string) to a name set."""
+        if value is None or value == "":
+            names: Any = default
+        elif isinstance(value, list):
+            names = value
+        else:
+            names = str(value).split(",")
+        return {_normalize_fn_name(n.strip()) for n in names if str(n).strip()}
+
+    @contextlib.contextmanager
+    def _decompiler(self, program: Any):
+        """A reusable DecompInterface for many functions (interprocedural taint),
+        disposed at the end. Use `_decompile` to decompile + cache against it."""
+        from ghidra.app.decompiler import DecompInterface, DecompileOptions  # type: ignore
+
+        iface = DecompInterface()
+        iface.setOptions(DecompileOptions())
+        iface.openProgram(program)
+        try:
+            yield iface
+        finally:
+            with contextlib.suppress(Exception):
+                iface.dispose()
+
+    @staticmethod
+    def _decompile(iface: Any, fn: Any, timeout: int, state: dict[str, Any]) -> Any:
+        """Decompile *fn* via a shared iface, caching the HighFunction and
+        bounding the total decompile count (a runaway-call backstop)."""
+        from ghidra.util.task import TaskMonitor  # type: ignore
+
+        key = int(fn.getEntryPoint().getOffset())
+        cache = state["cache"]
+        if key in cache:
+            return cache[key]
+        if state["decompiles"] >= state.get("cap", 400):
+            cache[key] = None
+            return None
+        state["decompiles"] += 1
+        res = iface.decompileFunction(fn, timeout, TaskMonitor.DUMMY)
+        high = res.getHighFunction() if res.decompileCompleted() else None
+        cache[key] = high
+        return high
+
+    def _function_src_bufs(
+        self, program: Any, high: Any, sources: set[str]
+    ) -> tuple[list[dict[str, Any]], dict[int, str]]:
+        """Source out-buffer sites in one function: each source call (read/recv/
+        fgets/getline/...) and the buffer-identity keys of the buffer it writes,
+        plus the function's stack-symbol map (for `&stackvar` resolution)."""
+        stack_syms = _stack_symbol_map(high)
+        src_bufs: list[dict[str, Any]] = []
+        it = high.getPcodeOps()
+        while it.hasNext():
+            op = it.next()
+            if str(op.getMnemonic()) not in ("CALL", "CALLIND"):
+                continue
+            callee = _callop_callee_name(program, op)
+            if callee not in sources:
+                continue
+            buf_idx = _TAINT_SOURCE_OUTBUF.get(callee)
+            if buf_idx is None:
+                continue
+            inputs = list(op.getInputs())
+            slot = buf_idx + 1  # input[0] is the call target
+            if slot >= len(inputs):
+                continue
+            keys = _buffer_keys(inputs[slot], stack_syms)
+            if keys:
+                src_bufs.append({
+                    "name": callee,
+                    "off": int(op.getSeqnum().getTarget().getOffset()),
+                    "keys": keys,
+                })
+        return src_bufs, stack_syms
+
+    def _arg_taint_origins(
+        self, program: Any, high: Any, arg_vn: Any, sources: set[str],
+        src_bufs: list[dict[str, Any]], stack_syms: dict[int, str], max_steps: int,
+    ) -> tuple[list, list, set, list, bool]:
+        """For one argument varnode, classify where its value comes from:
+        source return values, source out-buffers it aliases, and the parameter
+        indices of the containing function it derives from (the seam for
+        interprocedural propagation)."""
+        _, origins, truncated = _backward_slice(arg_vn, program, max_steps)
+        returns: list[tuple] = []
+        param_idxs: set[int] = set()
+        for o in origins:
+            kind = o.get("kind")
+            if kind == "call_result":
+                c = o.get("callee")
+                if c and _normalize_fn_name(c) in sources:
+                    returns.append((_normalize_fn_name(c), o.get("address")))
+            elif kind == "parameter" and o.get("param_index") is not None:
+                param_idxs.add(int(o["param_index"]))
+        outbufs: list[tuple] = []
+        if src_bufs:
+            argkeys = _buffer_keys_expanded(arg_vn, stack_syms)
+            if argkeys:
+                for sb in src_bufs:
+                    if sb["keys"] & argkeys:
+                        outbufs.append((sb["name"], sb["off"]))
+        return returns, outbufs, param_idxs, origins, truncated
+
+    def _interproc_taint(
+        self, program: Any, iface: Any, state: dict[str, Any], fn: Any,
+        param_idx: int, ip_depth: int, sources: set[str], max_steps: int, timeout: int,
+    ) -> list[dict[str, Any]]:
+        """Walk UP the call graph from (fn, param_idx): at each caller, the
+        actual argument passed for that parameter is checked for a source origin
+        (return value or out-buffer written before the call); if it instead
+        derives from the caller's OWN parameter, recurse one frame higher,
+        bounded by ip_depth. Conservative — it relies on the decompiler's own
+        arg/param model, so imperfect signatures cause MISSES, not false chains."""
+        fm = program.getFunctionManager()
+        rm = program.getReferenceManager()
+        results: list[dict[str, Any]] = []
+        work: list[tuple] = [(fn, param_idx, ip_depth, [])]
+        visited: set[tuple] = set()
+        while work:
+            cur_fn, pidx, depth, path = work.pop()
+            vkey = (int(cur_fn.getEntryPoint().getOffset()), pidx)
+            if vkey in visited:
+                continue
+            visited.add(vkey)
+            for ref in rm.getReferencesTo(cur_fn.getEntryPoint()):
+                if not ref.getReferenceType().isCall():
+                    continue
+                from_addr = ref.getFromAddress()
+                from_off = int(from_addr.getOffset())
+                caller = fm.getFunctionContaining(from_addr)
+                if caller is None:
+                    continue
+                high = self._decompile(iface, caller, timeout, state)
+                if high is None:
+                    continue
+                call_op = self._find_call_op(high, from_off)
+                if call_op is None:
+                    continue
+                cin = list(call_op.getInputs())
+                slot = pidx + 1  # input[0] is the call target
+                if slot >= len(cin):
+                    continue  # decompiler didn't model that arg -> conservative miss
+                src_bufs, stack_syms = self._function_src_bufs(program, high, sources)
+                returns, outbufs, pidxs, _, _ = self._arg_taint_origins(
+                    program, high, cin[slot], sources, src_bufs, stack_syms, max_steps
+                )
+                frame = f"{caller.getName()}@0x{from_off:x}"
+                for sname, saddr in returns:
+                    results.append({
+                        "source": sname, "source_at": saddr,
+                        "via": "return_value", "frames": path + [frame],
+                    })
+                for sname, soff in outbufs:
+                    if soff >= from_off:
+                        continue  # source must write the buffer before passing it
+                    results.append({
+                        "source": sname, "source_at": f"0x{soff:x}",
+                        "via": "out_buffer", "frames": path + [frame],
+                    })
+                if depth > 0:
+                    for pj in pidxs:
+                        work.append((caller, pj, depth - 1, path + [frame]))
+        return results
+
+    def _interproc_backward(
+        self, program: Any, iface: Any, state: dict[str, Any], fn: Any,
+        param_idx: int, ip_depth: int, max_steps: int, timeout: int,
+    ) -> list[dict[str, Any]]:
+        """Continue a backward slice ACROSS call boundaries: when a slice in *fn*
+        reaches parameter *param_idx*, walk to each caller, slice the actual
+        argument it passes, and collect those origins (tagged with the caller
+        frame and path). Recurse up to ip_depth frames. Same conservative
+        param->arg mapping as `_interproc_taint`: missing signatures under-report."""
+        fm = program.getFunctionManager()
+        rm = program.getReferenceManager()
+        results: list[dict[str, Any]] = []
+        seen_out: set[str] = set()
+        work: list[tuple] = [(fn, param_idx, ip_depth, [])]
+        visited: set[tuple] = set()
+        while work:
+            cur_fn, pidx, depth, path = work.pop()
+            vkey = (int(cur_fn.getEntryPoint().getOffset()), pidx)
+            if vkey in visited:
+                continue
+            visited.add(vkey)
+            for ref in rm.getReferencesTo(cur_fn.getEntryPoint()):
+                if not ref.getReferenceType().isCall():
+                    continue
+                from_addr = ref.getFromAddress()
+                from_off = int(from_addr.getOffset())
+                caller = fm.getFunctionContaining(from_addr)
+                if caller is None or caller.isThunk():
+                    continue
+                high = self._decompile(iface, caller, timeout, state)
+                if high is None:
+                    continue
+                call_op = self._find_call_op(high, from_off)
+                if call_op is None:
+                    continue
+                cin = list(call_op.getInputs())
+                slot = pidx + 1
+                if slot >= len(cin):
+                    continue  # decompiler didn't model that arg -> conservative
+                _, origins, _ = _backward_slice(cin[slot], program, max_steps)
+                frame = f"{caller.getName()}@0x{from_off:x}"
+                frames = path + [frame]
+                for o in origins:
+                    rec = dict(o)
+                    rec["frame"] = str(caller.getName())
+                    rec["path"] = frames
+                    dk = json.dumps(rec, sort_keys=True)
+                    if dk not in seen_out:
+                        seen_out.add(dk)
+                        results.append(rec)
+                    if (depth > 0 and o.get("kind") == "parameter"
+                            and o.get("param_index") is not None):
+                        work.append((caller, int(o["param_index"]), depth - 1, frames))
+        return results
+
+    def _op_taint_forward(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
+        """Forward taint: report source->sink chains. Intraprocedural by default,
+        two ways: (a) return_value — a sink arg backward-slices to a source
+        call's return value; (b) out_buffer — a sink arg refers to a buffer a
+        preceding source call WROTE via an out-parameter (read/recv/fgets/
+        getline/...). With interprocedural=True it also follows a sink arg that
+        derives from a parameter UP the call graph (bounded by ip_depth) to a
+        source in an ancestor frame, emitting a chain with the frame `path`.
+        Cross-function propagation off => 0 chains is still not an all-clear."""
+        handle = self.targets.resolve(params.get("target") or target, required=True)
+        assert handle is not None
+        program = handle.program
+        sources = self._name_set(params.get("sources"), _DEFAULT_TAINT_SOURCES)
+        sinks = self._name_set(params.get("sinks"), _DEFAULT_TAINT_SINKS)
+        scope_fn = params.get("function")
+        max_steps = int(params.get("max_steps", 400))
+        timeout = int(params.get("timeout", 60))
+        interprocedural = bool(params.get("interprocedural"))
+        ip_depth = int(params.get("ip_depth", 3))
+
+        fm = program.getFunctionManager()
+        rm = program.getReferenceManager()
+
+        # Locate sink call sites cheaply, grouped by the calling function.
+        sink_sites: dict[int, dict[str, Any]] = {}
+        for fn in fm.getFunctions(True):
+            if _normalize_fn_name(fn.getName()) not in sinks:
+                continue
+            sink_norm = _normalize_fn_name(fn.getName())
+            for ref in rm.getReferencesTo(fn.getEntryPoint()):
+                if not ref.getReferenceType().isCall():
+                    continue
+                from_addr = ref.getFromAddress()
+                caller = fm.getFunctionContaining(from_addr)
+                if caller is None:
+                    continue
+                # A thunk's body is just the trampoline branch to its target —
+                # not a real sink use site. Skipping it avoids a spurious
+                # (duplicate) chain through the sink's own .plt thunk, which
+                # interprocedural propagation would otherwise walk up.
+                if caller.isThunk():
+                    continue
+                key = int(caller.getEntryPoint().getOffset())
+                entry = sink_sites.setdefault(key, {"fn": caller, "sites": []})
+                entry["sites"].append((int(from_addr.getOffset()), sink_norm))
+
+        if scope_fn:
+            scope = _resolve_function(program, str(scope_fn))
+            skey = int(scope.getEntryPoint().getOffset())
+            sink_sites = {skey: sink_sites[skey]} if skey in sink_sites else {}
+
+        chains: list[dict[str, Any]] = []
+        scanned = 0
+        ip_state = {"cache": {}, "decompiles": 0, "cap": 400}
+        ip_cm = self._decompiler(program) if interprocedural else contextlib.nullcontext()
+        with ip_cm as ip_iface:
+            for info in sink_sites.values():
+                caller = info["fn"]
+                scanned += 1
+                try:
+                    with self._high_function(program, caller, timeout) as high:
+                        src_bufs, stack_syms = self._function_src_bufs(
+                            program, high, sources
+                        )
+                        seen_out: set[tuple] = set()
+                        seen_ip: set[tuple] = set()
+                        for call_off, sink_name in info["sites"]:
+                            call_op = self._find_call_op(high, call_off)
+                            if call_op is None:
+                                continue
+                            inputs = list(call_op.getInputs())
+                            for arg_idx in range(1, len(inputs)):
+                                returns, outbufs, param_idxs, origins, truncated = \
+                                    self._arg_taint_origins(
+                                        program, high, inputs[arg_idx], sources,
+                                        src_bufs, stack_syms, max_steps,
+                                    )
+                                # (a) intra return_value chains.
+                                for sname, saddr in returns:
+                                    chains.append({
+                                        "function": _func_brief(caller),
+                                        "source": sname,
+                                        "source_at": saddr,
+                                        "sink": sink_name,
+                                        "sink_at": f"0x{call_off:x}",
+                                        "arg": arg_idx - 1,
+                                        "via": "return_value",
+                                        "origins": origins,
+                                        "truncated": truncated,
+                                    })
+                                # (b) intra out_buffer chains: a preceding source
+                                # call wrote this buffer (source_addr < sink).
+                                for sname, soff in outbufs:
+                                    if soff >= call_off:
+                                        continue
+                                    dedup = (soff, call_off, arg_idx - 1)
+                                    if dedup in seen_out:
+                                        continue
+                                    seen_out.add(dedup)
+                                    chains.append({
+                                        "function": _func_brief(caller),
+                                        "source": sname,
+                                        "source_at": f"0x{soff:x}",
+                                        "sink": sink_name,
+                                        "sink_at": f"0x{call_off:x}",
+                                        "arg": arg_idx - 1,
+                                        "via": "out_buffer",
+                                    })
+                                # (c) interprocedural: the sink arg derives from a
+                                # parameter — follow it up the call graph.
+                                if interprocedural and param_idxs:
+                                    for pidx in param_idxs:
+                                        for r in self._interproc_taint(
+                                            program, ip_iface, ip_state, caller,
+                                            pidx, ip_depth, sources, max_steps, timeout,
+                                        ):
+                                            dk = (r["source"], r.get("source_at"),
+                                                  call_off, arg_idx - 1, r["via"])
+                                            if dk in seen_ip:
+                                                continue
+                                            seen_ip.add(dk)
+                                            chains.append({
+                                                "function": _func_brief(caller),
+                                                "source": r["source"],
+                                                "source_at": r.get("source_at"),
+                                                "sink": sink_name,
+                                                "sink_at": f"0x{call_off:x}",
+                                                "arg": arg_idx - 1,
+                                                "via": r["via"],
+                                                "interprocedural": True,
+                                                "ip_depth": len(r["frames"]),
+                                                "path": [f"{caller.getName()}@0x{call_off:x}"]
+                                                + r["frames"],
+                                            })
+                except OperationFailure:
+                    # A decompile failure on one function must not abort the scan.
+                    continue
+
+        sink_callsite_count = sum(len(info["sites"]) for info in sink_sites.values())
+        if interprocedural:
+            note = (
+                "interprocedural: sink arg -> source return_value/out_buffer in "
+                "this function, OR (following a parameter up to ip_depth frames) "
+                "a source in an ancestor frame. Bounded by the decompiler's "
+                "arg/param model, so missed signatures under-report rather than "
+                "fabricate; 0 chains is not an all-clear."
+            )
+        else:
+            note = (
+                "intraprocedural: sink arg -> source-call return_value OR a source "
+                "out_buffer (read/recv/fgets/getline/..) written before the sink, "
+                "within one function; cross-function propagation is NOT modeled "
+                "(pass interprocedural=true), so 0 chains is not an all-clear."
+            )
+        if scope_fn and sink_callsite_count == 0:
+            note = (
+                f"function {scope_fn!r} contains no calls to any configured sink "
+                f"({len(sinks)} sinks checked) — nothing to scan. " + note
+            )
+        # JSON output is key-sorted, so chain_count/chains already lead; the
+        # signal-burying problem is the *size* of the sources/sinks echo. Render
+        # them as compact single-line strings (one line each, not ~20-line
+        # arrays) so they no longer dominate a `| tail`.
+        result = {
+            "chain_count": len(chains),
+            "chains": chains,
+            "scanned_functions": scanned,
+            "sink_callsite_count": sink_callsite_count,
+            "note": note,
+            "source_count": len(sources),
+            "sink_count": len(sinks),
+            "sources_used": ", ".join(sorted(sources)),
+            "sinks_used": ", ".join(sorted(sinks)),
+        }
+        if interprocedural:
+            result["interprocedural"] = True
+            result["ip_depth"] = ip_depth
+        return result
+
+    def _resolve_slice_start(
+        self, high: Any, program: Any, at: Any, arg: Any, var_name: Any
+    ) -> tuple[Any, dict[str, Any]]:
+        """Resolve the varnode a backward slice starts from: either a named
+        variable's representative, or the Nth argument of a call at an address."""
+        if var_name:
+            sym = self._find_high_symbol(high, str(var_name))
+            if sym is None:
+                avail = self._available_var_names(high)
+                raise OperationFailure(
+                    "not_found",
+                    f"no variable named {var_name!r}; available: {', '.join(avail[:40])}",
+                )
+            hv = sym.getHighVariable()
+            if hv is None:
+                raise OperationFailure(
+                    "not_found", f"variable {var_name!r} has no SSA high variable"
+                )
+            return hv.getRepresentative(), {"kind": "variable", "variable": str(var_name)}
+
+        if at is not None:
+            target_off = _parse_address(program, at)
+            chosen = self._find_call_op(high, target_off)
+            if chosen is None:
+                raise OperationFailure("not_found", f"no call p-code op at 0x{target_off:x}")
+            inputs = list(chosen.getInputs())
+            arg_idx = int(arg) if arg is not None else 0
+            slot = arg_idx + 1  # input[0] is the call target; args start at 1
+            if slot < 1 or slot >= len(inputs):
+                raise OperationFailure(
+                    "bad_request",
+                    f"arg index {arg_idx} out of range (call at 0x{target_off:x} "
+                    f"has {len(inputs) - 1} args)",
+                )
+            return inputs[slot], {
+                "kind": "call_arg",
+                "address": f"0x{target_off:x}",
+                "arg": arg_idx,
+            }
+
+        raise OperationFailure(
+            "bad_request", "taint_backward requires either 'variable' or 'address'"
+        )
+
+    def _op_taint_backward(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
+        """Backward taint / slice: walk a sink argument (or a variable) back
+        through SSA def-use chains to its origins (parameters, constants, loads,
+        call results). Honest frontier-leaf classification; bounded by max_steps."""
+        handle = self.targets.resolve(params.get("target") or target, required=True)
+        assert handle is not None
+        program = handle.program
+        identifier = params.get("identifier")
+        if identifier is None:
+            raise OperationFailure("bad_request", "taint_backward requires 'identifier'")
+        fn = _resolve_function(program, str(identifier))
+
+        interprocedural = bool(params.get("interprocedural"))
+        ip_depth = int(params.get("ip_depth", 3))
+        max_steps = int(params.get("max_steps", 400))
+        timeout = int(params.get("timeout", 60))
+
+        with self._high_function(program, fn, timeout) as high:
+            start, start_desc = self._resolve_slice_start(
+                high, program, params.get("address"), params.get("arg"),
+                params.get("variable"),
+            )
+            slice_ops, origins, truncated = _backward_slice(start, program, max_steps)
+            result: dict[str, Any] = {
+                "function": _func_brief(fn),
+                "start": start_desc,
+                "slice_len": len(slice_ops),
+                "slice": slice_ops,
+                "origin_count": len(origins),
+                "origins": origins,
+                "truncated": truncated,
+            }
+
+        # Interprocedural: where the slice bottomed out at a parameter of `fn`,
+        # continue it in `fn`'s callers (the actual arg they pass), collecting
+        # origins in ancestor frames with the call path.
+        if interprocedural:
+            param_idxs = {
+                int(o["param_index"]) for o in origins
+                if o.get("kind") == "parameter" and o.get("param_index") is not None
+            }
+            ip_origins: list[dict[str, Any]] = []
+            if param_idxs:
+                ip_state = {"cache": {}, "decompiles": 0, "cap": 400}
+                with self._decompiler(program) as ip_iface:
+                    for pidx in param_idxs:
+                        ip_origins.extend(self._interproc_backward(
+                            program, ip_iface, ip_state, fn, pidx,
+                            ip_depth, max_steps, timeout,
+                        ))
+            result["interprocedural"] = True
+            result["ip_depth"] = ip_depth
+            result["interprocedural_origins"] = ip_origins
+            result["interprocedural_origin_count"] = len(ip_origins)
+        return result
+
+    def _callgraph_walk(self, program: Any, root_fn: Any, depth: int, mode: str) -> list[dict[str, Any]]:
+        """BFS the call graph from *root_fn* up to *depth* levels. mode is
+        'callees' (outgoing) or 'callers' (incoming). Dedups by function."""
+        fm = program.getFunctionManager()
+        space = program.getAddressFactory().getDefaultAddressSpace()
+        visited = {int(root_fn.getEntryPoint().getOffset())}
+        frontier = [root_fn]
+        nodes: list[dict[str, Any]] = []
+        for level in range(1, depth + 1):
+            next_frontier: list[Any] = []
+            for fn in frontier:
+                neighbors, _ = (
+                    _direct_callees(program, fn) if mode == "callees"
+                    else _direct_callers(program, fn)
+                )
+                for key, info in neighbors.items():
+                    if key in visited:
+                        continue
+                    visited.add(key)
+                    node = dict(info)
+                    node["level"] = level
+                    node["via"] = f"0x{int(fn.getEntryPoint().getOffset()):x}"
+                    nodes.append(node)
+                    nf = fm.getFunctionAt(space.getAddress(key))
+                    if nf is not None and not nf.isExternal():
+                        next_frontier.append(nf)
+            frontier = next_frontier
+            if not frontier:
+                break
+        nodes.sort(key=lambda n: (n["level"], int(n["address"], 16)))
+        return nodes
+
+    def _op_dataflow_callgraph(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
+        """Resolved call graph around a function: direct callees/callers, BFS to
+        --depth. Indirect call targets are NOT resolved yet (needs value-set);
+        their count is reported as `indirect_callsites` for honesty."""
+        handle = self.targets.resolve(params.get("target") or target, required=True)
+        assert handle is not None
+        program = handle.program
+        identifier = params.get("identifier")
+        if identifier is None:
+            raise OperationFailure("bad_request", "dataflow_callgraph requires 'identifier'")
+        direction = str(params.get("direction", "both")).lower()
+        if direction not in ("callees", "callers", "both"):
+            raise OperationFailure(
+                "bad_request", f"unknown direction: {direction!r} (use callees|callers|both)"
+            )
+        depth = int(params.get("depth", 1))
+        if depth < 1 or depth > 5:
+            raise OperationFailure("bad_request", "depth must be in 1..5")
+        fn = _resolve_function(program, str(identifier))
+
+        result: dict[str, Any] = {"function": _func_brief(fn), "depth": depth}
+        if direction in ("callees", "both"):
+            _, indirect = _direct_callees(program, fn)
+            result["callees"] = self._callgraph_walk(program, fn, depth, "callees")
+            result["indirect_callsites"] = indirect
+        if direction in ("callers", "both"):
+            result["callers"] = self._callgraph_walk(program, fn, depth, "callers")
+        return result
 
     def _op_bundle_function(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
         from ghidra.app.decompiler import DecompInterface, DecompileOptions  # type: ignore
@@ -1929,6 +3507,33 @@ class GhxBridge:
         handle = self.targets.resolve(params.get("target") or target, required=True)
         assert handle is not None
         program = handle.program
+
+        # `save <path>`: export a Ghidra Zip File (.gzf) — the analyzed-program
+        # archive, ghx's analog of bn's `save <path>.bndb`.
+        out_path = params.get("path")
+        if out_path:
+            from ghidra.app.util.exporter import GzfExporter  # type: ignore
+            from java.io import File  # type: ignore
+
+            out = Path(str(out_path)).expanduser()
+            if out.suffix.lower() != ".gzf":
+                out = out.parent / (out.name + ".gzf")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            exporter = GzfExporter()
+            ok = exporter.export(File(str(out)), program, None, pyghidra.task_monitor())
+            if not ok:
+                detail = ""
+                with contextlib.suppress(Exception):
+                    detail = str(exporter.getMessageLog())
+                raise OperationFailure("export_failed", f"gzf export failed: {detail}".strip())
+            return {
+                "saved": True,
+                "exported": True,
+                "format": "gzf",
+                "program_id": handle.program_id,
+                "path": str(out),
+            }
+
         df = program.getDomainFile()
         if df is None:
             raise OperationFailure(
@@ -2239,6 +3844,32 @@ class GhxBridge:
 # ---------------------------------------------------------------------------
 
 
+_FRAME_REGISTER_NAMES = {
+    # AArch64 / ARM
+    "sp", "fp", "lr", "pc", "xzr", "wzr", "x29", "x30", "w29", "w30",
+    # x86 / x86-64
+    "rbp", "rsp", "rip", "ebp", "esp", "eip",
+}
+
+
+def _decoded_string_value(rep: str) -> str:
+    """Strip Ghidra's C-literal decoration from a string representation.
+
+    `getDefaultValueRepresentation()` yields things like ``"libc.so.6"`` or
+    ``u8"libc.so.6"`` (encoding prefix + surrounding quotes). For querying we
+    want the bare content so that substring filters and anchored regexes match
+    the actual string, not the decoration.
+    """
+    s = rep
+    for pfx in ("u8", "U", "L", "u"):
+        if s.startswith(pfx + '"'):
+            s = s[len(pfx):]
+            break
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1]
+    return s
+
+
 def _surrounding_instructions(listing: Any, base_ins: Any, n: int) -> list[dict[str, Any]]:
     """Return up to |n| instructions before (n<0) or after (n>0) *base_ins*."""
     if n == 0:
@@ -2321,6 +3952,26 @@ def _read_ghidra_version(install_dir: Path) -> str:
         return "?"
 
 
+def _resolve_functions(program: Any, identifier: str) -> list[Any]:
+    """All functions matching an identifier. A single hex address yields one
+    function; a name may match several (a .plt thunk *and* the EXTERNAL symbol,
+    or genuinely overloaded names). Callers that want to union across thunks
+    (e.g. ``callsites``) use this instead of ``_resolve_function``."""
+    fm = program.getFunctionManager()
+    ident = identifier.strip()
+    if ident.lower().startswith("0x") or all(c in "0123456789abcdefABCDEF" for c in ident):
+        with contextlib.suppress(Exception):
+            addr = program.getAddressFactory().getAddress(ident)
+            if addr is not None:
+                fn = fm.getFunctionAt(addr) or fm.getFunctionContaining(addr)
+                if fn is not None:
+                    return [fn]
+    return [
+        fn for fn in fm.getFunctions(True)
+        if str(fn.getName()) == ident or str(fn.getName(True)) == ident
+    ]
+
+
 def _resolve_function(program: Any, identifier: str) -> Any:
     """Resolve a function by hex address or symbol name."""
     fm = program.getFunctionManager()
@@ -2366,6 +4017,19 @@ def _parse_address(program: Any, value: Any) -> int:
     return int(addr.getOffset())
 
 
+# Ghidra's synthetic memory block holding external-linkage trampolines — the
+# size-1 `is_thunk` stubs (memcpy, strtok, …) the ELF/PE loader manufactures so
+# the disassembler has a branch target for imports. bn does not model these as
+# functions, so `function list/search` hide them by default (parity).
+_EXTERNAL_BLOCK_NAME = "EXTERNAL"
+
+
+def _in_external_block(program: Any, entry: Any) -> bool:
+    """True if `entry` lies in Ghidra's synthetic EXTERNAL block."""
+    block = program.getMemory().getBlock(entry)
+    return block is not None and str(block.getName()) == _EXTERNAL_BLOCK_NAME
+
+
 def _func_brief(fn: Any) -> dict[str, Any]:
     entry = fn.getEntryPoint()
     return {
@@ -2377,6 +4041,18 @@ def _func_brief(fn: Any) -> dict[str, Any]:
     }
 
 
+def _sort_func_rows(items: list[dict[str, Any]], sort: str) -> list[dict[str, Any]]:
+    """Sort function-brief rows by 'address' (asc), 'name' (asc), or 'size'
+    (desc — biggest first, the useful order for triage). Ties break on address."""
+    if sort == "name":
+        items.sort(key=lambda r: (r["name"].lower(), int(r["address"], 16)))
+    elif sort == "size":
+        items.sort(key=lambda r: (-int(r["size"]), int(r["address"], 16)))
+    else:
+        items.sort(key=lambda r: int(r["address"], 16))
+    return items
+
+
 def _storage_str(var: Any) -> str | None:
     try:
         storage = var.getVariableStorage()
@@ -2385,6 +4061,555 @@ def _storage_str(var: Any) -> str | None:
         return str(storage)
     except Exception:
         return None
+
+
+def _storage_id(storage: Any) -> str | None:
+    """A stable handle for a variable's storage, dropping the ``:size`` suffix
+    so it survives both renames and retypes (e.g. ``RDI``, ``Stack[-0x10]``)."""
+    try:
+        if storage is None:
+            return None
+        s = str(storage)
+    except Exception:
+        return None
+    if not s:
+        return None
+    return s.rsplit(":", 1)[0] if ":" in s else s
+
+
+def _var_id(var: Any) -> str | None:
+    """Stable id for a stored Variable (parameter/local)."""
+    try:
+        return _storage_id(var.getVariableStorage())
+    except Exception:
+        return None
+
+
+def _high_sym_storage(high_sym: Any) -> Any:
+    """VariableStorage of a HighSymbol, or None."""
+    try:
+        return high_sym.getStorage()
+    except Exception:
+        return None
+
+
+def _block_name_for(program: Any, off: int) -> str | None:
+    """Name of the memory block (section/segment) containing an offset."""
+    try:
+        addr = program.getAddressFactory().getDefaultAddressSpace().getAddress(off)
+        block = program.getMemory().getBlock(addr)
+        return str(block.getName()) if block is not None else None
+    except Exception:
+        return None
+
+
+def _primary_symbol_name(program: Any, off: int) -> str | None:
+    """Primary symbol name at an offset, if any."""
+    try:
+        addr = program.getAddressFactory().getDefaultAddressSpace().getAddress(off)
+        sym = program.getSymbolTable().getPrimarySymbol(addr)
+        return str(sym.getName()) if sym is not None else None
+    except Exception:
+        return None
+
+
+def _read_pointer(program: Any, off: int, size: int) -> int | None:
+    """Read a little/big-endian pointer of *size* bytes at *off*. None if unmapped."""
+    base = program.getAddressFactory().getDefaultAddressSpace().getAddress(off)
+    mem = program.getMemory()
+    raw: list[int] = []
+    for i in range(size):
+        try:
+            raw.append(int(mem.getByte(base.add(i))) & 0xFF)
+        except Exception:
+            return None
+    big = bool(program.getLanguage().isBigEndian())
+    order = raw if big else list(reversed(raw))
+    value = 0
+    for byte in order:
+        value = (value << 8) | byte
+    return value
+
+
+def _resolve_pointer_target(program: Any, value: int) -> dict[str, Any]:
+    """Classify what a pointer value points at: function, symbol, data, or unmapped."""
+    out: dict[str, Any] = {"value": f"0x{value:x}"}
+    try:
+        addr = program.getAddressFactory().getDefaultAddressSpace().getAddress(value)
+    except Exception:
+        out["kind"] = "unmapped"
+        return out
+    fm = program.getFunctionManager()
+    fn = fm.getFunctionAt(addr) or fm.getFunctionContaining(addr)
+    if fn is not None:
+        out["kind"] = "function"
+        out["target"] = str(fn.getName())
+        out["is_external"] = bool(fn.isExternal())
+        return out
+    sym = program.getSymbolTable().getPrimarySymbol(addr)
+    if sym is not None:
+        out["kind"] = "symbol"
+        out["target"] = str(sym.getName())
+        return out
+    block = program.getMemory().getBlock(addr)
+    if block is not None:
+        out["kind"] = "data"
+        out["section"] = str(block.getName())
+        return out
+    out["kind"] = "unmapped"
+    return out
+
+
+def _varnode_desc(vn: Any, program: Any = None) -> dict[str, Any] | None:
+    """Compact JSON descriptor for a p-code Varnode (input or output)."""
+    if vn is None:
+        return None
+    size = int(vn.getSize())
+    d: dict[str, Any] = {"size": size, "offset": int(vn.getOffset())}
+    try:
+        d["space"] = str(vn.getAddress().getAddressSpace().getName())
+    except Exception:
+        pass
+    if vn.isConstant():
+        d["kind"] = "const"
+        mask = (1 << (8 * size)) - 1 if size else None
+        raw = int(vn.getOffset())
+        d["value"] = f"0x{(raw & mask) if mask else raw:x}"
+    elif vn.isRegister():
+        d["kind"] = "register"
+        if program is not None:
+            try:
+                reg = program.getRegister(vn.getAddress(), size)
+                if reg is not None:
+                    d["register"] = str(reg.getName())
+            except Exception:
+                pass
+    elif vn.isUnique():
+        d["kind"] = "unique"
+    elif vn.isAddress():
+        d["kind"] = "ram"
+        if program is not None:
+            try:
+                sym = program.getSymbolTable().getPrimarySymbol(vn.getAddress())
+                if sym is not None:
+                    d["symbol"] = str(sym.getName())
+            except Exception:
+                pass
+    else:
+        d["kind"] = "other"
+    # High-variable name, if present (high p-code form).
+    try:
+        hv = vn.getHigh()
+        if hv is not None:
+            nm = hv.getName()
+            if nm and str(nm) not in ("UNNAMED", "null"):
+                d["var"] = str(nm)
+    except Exception:
+        pass
+    return d
+
+
+def _pcode_desc(op: Any, addr: int, index: int, program: Any = None) -> dict[str, Any]:
+    """Compact JSON descriptor for a single PcodeOp."""
+    inputs: list[Any] = []
+    try:
+        for vn in op.getInputs():
+            inputs.append(_varnode_desc(vn, program))
+    except Exception:
+        pass
+    try:
+        out = _varnode_desc(op.getOutput(), program)
+    except Exception:
+        out = None
+    try:
+        mnem = str(op.getMnemonic())
+    except Exception:
+        mnem = str(op)
+    try:
+        opcode = int(op.getOpcode())
+    except Exception:
+        opcode = None
+    return {
+        "index": int(index),
+        "address": f"0x{int(addr):x}",
+        "op": mnem,
+        "opcode": opcode,
+        "output": out,
+        "inputs": inputs,
+    }
+
+
+def _high_pcode_desc(op: Any, program: Any = None) -> dict[str, Any] | None:
+    """Describe a high (SSA) PcodeOp, deriving its address from the seqnum."""
+    if op is None:
+        return None
+    try:
+        tgt = op.getSeqnum().getTarget()
+        off = int(tgt.getOffset()) if tgt is not None else 0
+    except Exception:
+        off = 0
+    return _pcode_desc(op, off, 0, program)
+
+
+def _signed_hex(v: int) -> str:
+    """Render a (possibly 64-bit-unsigned) offset as a signed hex literal."""
+    if v >= (1 << 63):
+        v -= 1 << 64
+    return f"-0x{-v:x}" if v < 0 else f"0x{v:x}"
+
+
+def _fmt_vn(d: dict[str, Any] | None) -> str:
+    """Render a varnode descriptor as a readable token, preferring the SSA
+    HighVariable name, then a resolved register/symbol name, over the raw
+    (space, offset, size) tuple that Ghidra's PcodeOp.toString emits."""
+    if d is None:
+        return "---"
+    kind = d.get("kind")
+    if kind == "const":
+        return f"#{d.get('value')}"
+    if d.get("var"):
+        return str(d["var"])
+    if kind == "register":
+        return str(d.get("register") or f"reg+{d.get('offset')}")
+    if kind == "unique":
+        off = d.get("offset")
+        return f"u{off:x}" if isinstance(off, int) else f"u:{off}"
+    if kind == "ram":
+        if d.get("symbol"):
+            return str(d["symbol"])
+        off = d.get("offset")
+        return f"0x{off:x}" if isinstance(off, int) else f"ram:{off}"
+    off = d.get("offset")
+    space = d.get("space", "?")
+    if isinstance(off, int):
+        return f"{space}[{_signed_hex(off)}]"
+    return f"{space}:{off}"
+
+
+def _format_pcode_line(desc: dict[str, Any]) -> str:
+    """Format a structured p-code descriptor as ``out = OP a, b`` with named
+    varnodes — the readable analogue of Ghidra's raw PcodeOp.toString()."""
+    out = desc.get("output")
+    ins = ", ".join(_fmt_vn(v) for v in (desc.get("inputs") or []))
+    lhs = f"{_fmt_vn(out)} = " if out is not None else ""
+    body = f"{lhs}{desc.get('op')}"
+    return f"{body} {ins}" if ins else body
+
+
+def _classify_leaf(vn: Any, program: Any) -> dict[str, Any]:
+    """Classify a backward-slice frontier leaf (a varnode with no SSA def)."""
+    out: dict[str, Any] = {"varnode": _varnode_desc(vn, program)}
+    hv = None
+    try:
+        hv = vn.getHigh()
+    except Exception:
+        hv = None
+    if hv is not None:
+        try:
+            sym = hv.getSymbol()
+            if sym is not None:
+                out["name"] = str(sym.getName())
+                if sym.isParameter():
+                    out["kind"] = "parameter"
+                    try:
+                        out["param_index"] = int(sym.getCategoryIndex())
+                    except Exception:
+                        pass
+                    return out
+                if sym.isGlobal():
+                    out["kind"] = "global"
+                    return out
+        except Exception:
+            pass
+    # No def and not a tracked symbol: an entry-state register/stack slot.
+    out["kind"] = "input"
+    return out
+
+
+def _backward_slice(
+    start: Any, program: Any, max_steps: int = 400
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """Walk SSA def-use chains backward from *start*, collecting the slice ops
+    and classifying frontier leaves (origins). Honest about truncation."""
+    worklist = [start]
+    seen: set[str] = set()
+    slice_ops: list[dict[str, Any]] = []
+    origins: list[dict[str, Any]] = []
+    steps = 0
+    while worklist and steps < max_steps:
+        vn = worklist.pop()
+        key = str(vn)
+        if key in seen:
+            continue
+        seen.add(key)
+        steps += 1
+
+        if vn.isConstant():
+            origins.append({"kind": "const", "value": f"0x{int(vn.getOffset()):x}"})
+            continue
+        defop = vn.getDef()
+        if defop is None:
+            origins.append(_classify_leaf(vn, program))
+            continue
+
+        mnem = str(defop.getMnemonic())
+        desc = _high_pcode_desc(defop, program)
+        if desc is not None:
+            slice_ops.append(desc)
+        inputs = list(defop.getInputs())
+
+        if mnem in ("CALL", "CALLIND"):
+            callee = None
+            if inputs:
+                try:
+                    callee = _resolve_pointer_target(
+                        program, int(inputs[0].getOffset())
+                    ).get("target")
+                except Exception:
+                    callee = None
+            origins.append(
+                {
+                    "kind": "call_result",
+                    "address": desc["address"] if desc else None,
+                    "callee": callee,
+                }
+            )
+            continue
+        if mnem == "LOAD":
+            origins.append({"kind": "load", "address": desc["address"] if desc else None})
+            # Keep slicing the pointer expression (input[1]) to learn its origin.
+            if len(inputs) >= 2 and not inputs[1].isConstant():
+                worklist.append(inputs[1])
+            continue
+
+        for inp in inputs:
+            if inp.isConstant():
+                origins.append({"kind": "const", "value": f"0x{int(inp.getOffset()):x}"})
+            else:
+                worklist.append(inp)
+
+    truncated = steps >= max_steps and bool(worklist)
+    # Dedup origins (constants in particular recur).
+    deduped: list[dict[str, Any]] = []
+    seen_origin: set[str] = set()
+    for o in origins:
+        k = json.dumps(o, sort_keys=True)
+        if k in seen_origin:
+            continue
+        seen_origin.add(k)
+        deduped.append(o)
+    return slice_ops, deduped, truncated
+
+
+_DEFAULT_TAINT_SOURCES = (
+    "recv", "recvfrom", "read", "fread", "fgets", "gets", "getenv",
+    "scanf", "fscanf", "sscanf", "readlink", "getline",
+)
+_DEFAULT_TAINT_SINKS = (
+    "strcpy", "strcat", "sprintf", "vsprintf", "memcpy", "memmove", "gets",
+    "system", "popen", "execl", "execlp", "execle", "execv", "execvp",
+    "strncpy", "strncat", "snprintf",
+)
+
+
+def _normalize_fn_name(name: Any) -> str:
+    """Strip @plt/.plt suffixes and leading underscores so import/thunk names
+    (`strcpy`, `_strcpy`, `strcpy@plt`) all match a configured source/sink."""
+    n = str(name)
+    for suffix in ("@plt", ".plt"):
+        if n.endswith(suffix):
+            n = n[: -len(suffix)]
+    return n.lstrip("_")
+
+
+# 0-based index of the out-buffer argument each source WRITES. The written
+# buffer (not the return value) is the real taint origin for these. getline/
+# getdelim take a `char **` in arg0; `_buffer_keys` resolves `&line` to the
+# `line` variable, so the double indirection matches uniformly with direct
+# pointers. Variadic scanf-family sources are intentionally absent (the buffer
+# arg can't be picked statically).
+_TAINT_SOURCE_OUTBUF: dict[str, int] = {
+    "read": 1, "pread": 1, "recv": 1, "recvfrom": 1, "readlink": 1,
+    "fgets": 0, "gets": 0, "fread": 0,
+    "getline": 0, "getdelim": 0,
+}
+
+
+def _signed(val: int, size: int) -> int:
+    """Interpret an unsigned varnode/const offset as a signed integer."""
+    bits = size * 8
+    if bits > 0 and val >= (1 << (bits - 1)):
+        val -= 1 << bits
+    return val
+
+
+def _callop_callee_name(program: Any, op: Any) -> str | None:
+    """Normalized callee name of a CALL/CALLIND high-pcode op, or None. input[0]
+    of a direct CALL is the target address varnode."""
+    try:
+        inputs = op.getInputs()
+        if not inputs:
+            return None
+        ca = inputs[0].getAddress()
+        if ca is None:
+            return None
+        fm = program.getFunctionManager()
+        fn = fm.getFunctionAt(ca) or fm.getFunctionContaining(ca)
+        return _normalize_fn_name(fn.getName()) if fn is not None else None
+    except Exception:
+        return None
+
+
+def _stack_symbol_map(high: Any) -> dict[int, str]:
+    """{stack offset -> storage id} for a function's stack-backed symbols, so a
+    `&stackvar` PTRSUB(frame, off) can be resolved to the variable living at
+    that offset (the getline `&line` -> `line` case)."""
+    out: dict[int, str] = {}
+    try:
+        it = high.getLocalSymbolMap().getSymbols()
+    except Exception:
+        return out
+    while it.hasNext():
+        sym = it.next()
+        st = _high_sym_storage(sym)
+        try:
+            if st is not None and st.isStackStorage():
+                out[int(st.getStackOffset())] = _storage_id(st)
+        except Exception:
+            continue
+    return out
+
+
+def _buffer_keys(vn: Any, stack_syms: dict[int, str]) -> set:
+    """Identity keys for the memory buffer a varnode denotes, used to match a
+    source's out-buffer argument against a sink argument within one function:
+
+      (1) the variable's own storage  — a heap pointer held in a stack slot or
+          register, and the value side of a getline double pointer (`line`);
+      (2) a `&stackvar` address expression PTRSUB((register,_,_), OFF) — both as
+          an address identity (matches `&buf` on both sides for stack arrays)
+          and resolved through the stack-symbol map to the variable at OFF.
+
+    Empirically the PTRSUB offset equals the Stack[OFF] storage offset on both
+    x86-64 (frame reg 0x20) and AArch64 (0x8), so the resolution is arch-robust.
+    """
+    keys: set = set()
+    if vn is None:
+        return keys
+    try:
+        hv = vn.getHigh()
+        sym = hv.getSymbol() if hv is not None else None
+        if sym is not None:
+            sid = _storage_id(_high_sym_storage(sym))
+            if sid:
+                keys.add(("stor", sid))
+    except Exception:
+        pass
+    try:
+        defop = vn.getDef()
+        if defop is not None and str(defop.getMnemonic()) == "PTRSUB":
+            ip = list(defop.getInputs())
+            if len(ip) == 2 and ip[1].isConstant():
+                off = _signed(int(ip[1].getOffset()), ip[1].getSize())
+                keys.add(("addr", str(ip[0]), off))
+                if off in stack_syms:
+                    keys.add(("stor", stack_syms[off]))
+    except Exception:
+        pass
+    return keys
+
+
+def _buffer_keys_expanded(vn: Any, stack_syms: dict[int, str], depth: int = 3) -> set:
+    """`_buffer_keys` plus a shallow walk through copies/casts and pointer+const
+    arithmetic, so `buf + off` and renamed copies still match the source buffer.
+    Deliberately does NOT cross PTRSUB bases, phi (MULTIEQUAL) merges, or
+    non-constant additions — those would over-connect distinct buffers and the
+    correctness bar is "no false chains"."""
+    keys: set = set()
+    seen: set[str] = set()
+    work = [(vn, 0)]
+    while work:
+        v, d = work.pop()
+        if v is None:
+            continue
+        vk = str(v)
+        if vk in seen:
+            continue
+        seen.add(vk)
+        keys |= _buffer_keys(v, stack_syms)
+        if d >= depth:
+            continue
+        defop = v.getDef()
+        if defop is None:
+            continue
+        mnem = str(defop.getMnemonic())
+        ins = list(defop.getInputs())
+        if mnem in ("COPY", "CAST"):
+            if ins and not ins[0].isConstant():
+                work.append((ins[0], d + 1))
+        elif mnem in ("INT_ADD", "PTRADD"):
+            nonconst = [i for i in ins if not i.isConstant()]
+            if len(nonconst) == 1:
+                work.append((nonconst[0], d + 1))
+    return keys
+
+
+def _direct_callees(program: Any, fn: Any) -> tuple[dict[int, dict[str, Any]], int]:
+    """Resolved direct callees of *fn* (keyed by entry offset) plus a count of
+    call sites whose target did not resolve to a function (indirect/unresolved)."""
+    fm = program.getFunctionManager()
+    out: dict[int, dict[str, Any]] = {}
+    unresolved = 0
+    for ins in program.getListing().getInstructions(fn.getBody(), True):
+        for ref in ins.getReferencesFrom():
+            if not ref.getReferenceType().isCall():
+                continue
+            callee = fm.getFunctionAt(ref.getToAddress())
+            site = f"0x{int(ins.getAddress().getOffset()):x}"
+            if callee is None:
+                unresolved += 1
+                continue
+            key = int(callee.getEntryPoint().getOffset())
+            node = out.setdefault(
+                key,
+                {
+                    "name": str(callee.getName()),
+                    "address": f"0x{key:x}",
+                    "is_external": bool(callee.isExternal()),
+                    "call_sites": [],
+                },
+            )
+            node["call_sites"].append(site)
+    return out, unresolved
+
+
+def _direct_callers(program: Any, fn: Any) -> tuple[dict[int, dict[str, Any]], int]:
+    """Resolved direct callers of *fn* (keyed by entry offset)."""
+    fm = program.getFunctionManager()
+    rm = program.getReferenceManager()
+    out: dict[int, dict[str, Any]] = {}
+    unresolved = 0
+    for ref in rm.getReferencesTo(fn.getEntryPoint()):
+        if not ref.getReferenceType().isCall():
+            continue
+        from_addr = ref.getFromAddress()
+        caller = fm.getFunctionContaining(from_addr)
+        site = f"0x{int(from_addr.getOffset()):x}"
+        if caller is None:
+            unresolved += 1
+            continue
+        key = int(caller.getEntryPoint().getOffset())
+        node = out.setdefault(
+            key,
+            {
+                "name": str(caller.getName()),
+                "address": f"0x{key:x}",
+                "is_external": bool(caller.isExternal()),
+                "call_sites": [],
+            },
+        )
+        node["call_sites"].append(site)
+    return out, unresolved
 
 
 def _resolve_symbol(program: Any, identifier: str) -> tuple[Any, str]:
@@ -2630,11 +4855,12 @@ def _apply_local_mutation(
                 "decompile_failed", "decompiler did not return a high function"
             )
 
-        # First try the stored Variable.  Fall back to HighSymbol for
-        # decompiler-introduced locals that only live in the HighFunction.
+        # First try the stored Variable, matching by name OR stable storage id.
+        # Fall back to HighSymbol for decompiler-introduced locals that only
+        # live in the HighFunction.
         match_var = None
         for cand in list(fn.getLocalVariables()) + list(fn.getParameters()):
-            if str(cand.getName()) == var_name:
+            if str(cand.getName()) == var_name or _var_id(cand) == var_name:
                 match_var = cand
                 break
 
@@ -2642,7 +4868,7 @@ def _apply_local_mutation(
         sym_iter = high.getLocalSymbolMap().getSymbols()
         while sym_iter.hasNext():
             hs = sym_iter.next()
-            if str(hs.getName()) == var_name:
+            if str(hs.getName()) == var_name or _storage_id(_high_sym_storage(hs)) == var_name:
                 high_sym = hs
                 break
 
@@ -2657,8 +4883,17 @@ def _apply_local_mutation(
             except Exception:
                 pass
 
+        # Resolve the matched variable's actual current name (var_name may be a
+        # stable id rather than the live name).
+        if match_var is not None:
+            resolved_name = str(match_var.getName())
+        elif high_sym is not None:
+            resolved_name = str(high_sym.getName())
+        else:
+            resolved_name = var_name
+
         before_state = {
-            "name": var_name,
+            "name": resolved_name,
             "type": (
                 str(match_var.getDataType().getName())
                 if match_var is not None
@@ -2666,7 +4901,7 @@ def _apply_local_mutation(
             ),
         }
 
-        effective_new_name = new_name if new_name is not None else var_name
+        effective_new_name = new_name if new_name is not None else resolved_name
         effective_new_type = resolved_type if resolved_type is not None else (
             match_var.getDataType() if match_var is not None
             else (high_sym.getDataType() if high_sym is not None else None)
@@ -2708,7 +4943,7 @@ def _apply_local_mutation(
             # a valid outcome for decompiler-introduced locals.
             return True, {"name": effective_new_name, "note": "only visible in HighFunction"}
 
-        description = f"ghx:local_mutate {fn.getName()}:{var_name}"
+        description = f"ghx:local_mutate {fn.getName()}:{resolved_name}"
         return _run_mutation(
             program,
             description=description,

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import pins
 from .paths import bridge_registry_path, bridge_socket_path, instances_dir
 
 
@@ -125,6 +126,13 @@ def choose_instance(instance_id: str | None = None, *, auto_start: bool = True) 
             if inst.instance_id == instance_id or instance_selector(inst) == instance_id:
                 return inst
         raise BridgeError(f"No ghx bridge instance found with id: {instance_id}")
+    # No explicit selection: honour a sticky pin if it points at a live
+    # instance. A stale/absent pin falls through to normal resolution.
+    pinned = pins.get_instance()
+    if pinned:
+        for inst in instances:
+            if inst.instance_id == pinned or instance_selector(inst) == pinned:
+                return inst
     if len(instances) == 1:
         return instances[0]
     if instances:
@@ -209,6 +217,51 @@ def _send_request_to_instance(
     raise BridgeError(str(error))
 
 
+_LOG_ERROR_MARKERS = (
+    "Exception",
+    "Error",
+    "Caused by",
+    "Traceback",
+    "not permitted",
+    "Errno",
+)
+
+
+def _read_log_tail(log_path: Path, *, max_lines: int = 15, max_chars: int = 2000) -> str:
+    """Return a compact tail of a spawn log, for surfacing the cause of a crash.
+
+    Keeps the last ``max_lines`` non-empty lines (the fatal error and any
+    stack frames are near the end before the process exits), but always
+    includes lines that match a known error marker even if they fall outside
+    the tail window, so a Java exception header printed before its stack isn't
+    lost. Truncated to ``max_chars`` total.
+    """
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    tail = lines[-max_lines:]
+    marked = [ln for ln in lines if any(m in ln for m in _LOG_ERROR_MARKERS)]
+    # Prepend any error-marked lines that aren't already in the tail window.
+    extra = [ln for ln in marked if ln not in tail]
+    selected = extra[-max_lines:] + tail if extra else tail
+    rendered = "\n".join(selected)
+    if len(rendered) > max_chars:
+        rendered = "…\n" + rendered[-max_chars:]
+    return rendered
+
+
+def _spawn_failure_detail(log_path: Path) -> str:
+    """Format the log tail as a suffix for a spawn BridgeError message."""
+    tail = _read_log_tail(log_path)
+    if not tail:
+        return f" Check {log_path}"
+    return f"\n--- last log lines ({log_path}) ---\n{tail}"
+
+
 def _find_ghx_agent() -> list[str]:
     """Return the command to invoke ghx-agent."""
     exe_dir = Path(sys.executable).parent
@@ -271,13 +324,15 @@ def spawn_instance(
         if proc.poll() is not None:
             raise BridgeError(
                 f"ghx-agent (pid {proc.pid}, instance {instance_id}) exited "
-                f"with code {proc.returncode} before registering. Check {log_path}"
+                f"with code {proc.returncode} before registering."
+                f"{_spawn_failure_detail(log_path)}"
             )
         time.sleep(poll_interval)
 
     raise BridgeError(
         f"Auto-started ghx-agent (pid {proc.pid}, instance {instance_id}) "
-        f"did not register within {timeout:.0f}s. Check {log_path}"
+        f"did not register within {timeout:.0f}s."
+        f"{_spawn_failure_detail(log_path)}"
     )
 
 
