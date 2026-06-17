@@ -172,9 +172,13 @@ or a documented engine difference):
   NB: bn `callsites` REQUIRES a scope (`--within`/`--within-file`); its
   whole-program "callers of X" is `bn xrefs <name>`. ghx `callsites <name>` is
   whole-program by default — both reach the same answer, mapped via xrefs here.
-- [ ] **decompiler/types.** Naming (`sub_` vs `FUN_`), inferred return types
-  (`uint64_t` vs `void`), line counts (216 vs 139) differ — engine difference.
-  Verify the same *logic* is recovered, document rather than force byte-equality.
+- [x] **decompiler/types — logic-equivalence verified.** A/B decompiled
+  `FUN_00400f20` in both engines and compared the CALL fingerprint: bn and ghx
+  recover the IDENTICAL libc-call set (fopen, getline, fclose, free, strlen,
+  strcmp, fprintf, fwrite, strerror) with the same control structure. Only the
+  PRESENTATION differs — line count (bn 215 / ghx 139), `sub_` vs `FUN_` naming,
+  inferred return types (`uint64_t` vs `void`). DOCUMENTED engine difference: the
+  same logic is recovered; we do not force byte-equality.
 - [~] **Run on a corpus, not one 13KB binary.** Started: ran the harness on
   `/bin/ls` (x86-64, PIE, 142KB) alongside `fw-A/bin-1` (AArch64, non-PIE, 13KB).
   This surfaced two things: (1) the imports data-symbol gap (now fixed, above) —
@@ -320,6 +324,11 @@ ghx is missing these in several places:
   high = SSA decompiler p-code); help text now documents the mapping.
 - [ ] `decompile`: bn has `--force-analysis` (override Ghidra's skip on huge
   funcs and reanalyze). ghx has `--timeout`; add `--force-analysis` equivalent.
+  DEFERRED: implementing it (raise the decompiler's size/payload limit) is easy,
+  but the correctness bar can't be met without a function large enough to trip
+  Ghidra's skip — none in the current corpus (bin-1, /bin/ls, /bin/true). Revisit
+  with a large binary. NB: this is also the lever for the interprocedural-taint
+  `nargs=0` gap (deeper param-ID analysis), so worth pairing with that.
 
 ### P2 — session / instance management
 CORRECTION (verified against bn 0.20.0 `--help`): the backlog below assumed a
