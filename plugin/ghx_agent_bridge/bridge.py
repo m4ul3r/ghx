@@ -916,16 +916,21 @@ class GhxBridge:
         if identifier is None:
             raise OperationFailure("bad_request", "il requires 'identifier'")
 
+        raw = bool(params.get("raw", False))
+        show_indirect = bool(params.get("indirect", False))
+
         program = handle.program
         fn = _resolve_function(program, str(identifier))
 
-        lines: list[str] = []
+        # Collect (PcodeOp, address, index) uniformly for both forms, then
+        # derive structured `ops` and the text rendering from one pass.
+        collected: list[tuple[Any, int, int]] = []
         if form == "raw":
             listing = program.getListing()
             for ins in listing.getInstructions(fn.getBody(), True):
                 addr = int(ins.getAddress().getOffset())
-                for op in ins.getPcode():
-                    lines.append(f"{addr:08x}  {op}")
+                for i, op in enumerate(ins.getPcode()):
+                    collected.append((op, addr, i))
         else:
             from ghidra.app.decompiler import DecompInterface, DecompileOptions  # type: ignore
             from ghidra.util.task import TaskMonitor  # type: ignore
@@ -934,7 +939,9 @@ class GhxBridge:
             iface.setOptions(DecompileOptions())
             iface.openProgram(program)
             try:
-                results = iface.decompileFunction(fn, 60, TaskMonitor.DUMMY)
+                results = iface.decompileFunction(
+                    fn, int(params.get("timeout", 60)), TaskMonitor.DUMMY
+                )
                 if not results.decompileCompleted():
                     raise OperationFailure(
                         "decompile_failed",
@@ -947,19 +954,45 @@ class GhxBridge:
                         "decompiler did not produce a high function",
                     )
                 it = high.getPcodeOps()
+                seq = 0
                 while it.hasNext():
                     op = it.next()
                     target_addr = op.getSeqnum().getTarget()
                     off = int(target_addr.getOffset()) if target_addr is not None else 0
-                    lines.append(f"{off:08x}  {op}")
+                    collected.append((op, off, seq))
+                    seq += 1
             finally:
                 with contextlib.suppress(Exception):
                     iface.dispose()
 
+        ops = [_pcode_desc(op, addr, idx, program) for (op, addr, idx) in collected]
+
+        lines: list[str] = []
+        hidden = 0
+        if raw:
+            # Legacy: Ghidra's unformatted PcodeOp.toString (raw varnode tuples).
+            for op, addr, _idx in collected:
+                lines.append(f"{addr:08x}  {op}")
+        else:
+            for desc in ops:
+                if not show_indirect and desc.get("op") == "INDIRECT":
+                    hidden += 1
+                    continue
+                lines.append(f"{int(desc['address'], 16):08x}  {_format_pcode_line(desc)}")
+            if hidden:
+                lines.append(
+                    f"; {hidden} INDIRECT op(s) hidden "
+                    f"(call/store side-effects; --indirect to show)"
+                )
+
         return {
             "function": _func_brief(fn),
             "form": form,
+            "raw": raw,
+            "op_count": len(ops),
+            "hidden_indirect": hidden,
             "text": "\n".join(lines),
+            "ops": ops,
         }
 
     def _op_disasm(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
@@ -2719,13 +2752,170 @@ class GhxBridge:
             names = str(value).split(",")
         return {_normalize_fn_name(n.strip()) for n in names if str(n).strip()}
 
+    @contextlib.contextmanager
+    def _decompiler(self, program: Any):
+        """A reusable DecompInterface for many functions (interprocedural taint),
+        disposed at the end. Use `_decompile` to decompile + cache against it."""
+        from ghidra.app.decompiler import DecompInterface, DecompileOptions  # type: ignore
+
+        iface = DecompInterface()
+        iface.setOptions(DecompileOptions())
+        iface.openProgram(program)
+        try:
+            yield iface
+        finally:
+            with contextlib.suppress(Exception):
+                iface.dispose()
+
+    @staticmethod
+    def _decompile(iface: Any, fn: Any, timeout: int, state: dict[str, Any]) -> Any:
+        """Decompile *fn* via a shared iface, caching the HighFunction and
+        bounding the total decompile count (a runaway-call backstop)."""
+        from ghidra.util.task import TaskMonitor  # type: ignore
+
+        key = int(fn.getEntryPoint().getOffset())
+        cache = state["cache"]
+        if key in cache:
+            return cache[key]
+        if state["decompiles"] >= state.get("cap", 400):
+            cache[key] = None
+            return None
+        state["decompiles"] += 1
+        res = iface.decompileFunction(fn, timeout, TaskMonitor.DUMMY)
+        high = res.getHighFunction() if res.decompileCompleted() else None
+        cache[key] = high
+        return high
+
+    def _function_src_bufs(
+        self, program: Any, high: Any, sources: set[str]
+    ) -> tuple[list[dict[str, Any]], dict[int, str]]:
+        """Source out-buffer sites in one function: each source call (read/recv/
+        fgets/getline/...) and the buffer-identity keys of the buffer it writes,
+        plus the function's stack-symbol map (for `&stackvar` resolution)."""
+        stack_syms = _stack_symbol_map(high)
+        src_bufs: list[dict[str, Any]] = []
+        it = high.getPcodeOps()
+        while it.hasNext():
+            op = it.next()
+            if str(op.getMnemonic()) not in ("CALL", "CALLIND"):
+                continue
+            callee = _callop_callee_name(program, op)
+            if callee not in sources:
+                continue
+            buf_idx = _TAINT_SOURCE_OUTBUF.get(callee)
+            if buf_idx is None:
+                continue
+            inputs = list(op.getInputs())
+            slot = buf_idx + 1  # input[0] is the call target
+            if slot >= len(inputs):
+                continue
+            keys = _buffer_keys(inputs[slot], stack_syms)
+            if keys:
+                src_bufs.append({
+                    "name": callee,
+                    "off": int(op.getSeqnum().getTarget().getOffset()),
+                    "keys": keys,
+                })
+        return src_bufs, stack_syms
+
+    def _arg_taint_origins(
+        self, program: Any, high: Any, arg_vn: Any, sources: set[str],
+        src_bufs: list[dict[str, Any]], stack_syms: dict[int, str], max_steps: int,
+    ) -> tuple[list, list, set, list, bool]:
+        """For one argument varnode, classify where its value comes from:
+        source return values, source out-buffers it aliases, and the parameter
+        indices of the containing function it derives from (the seam for
+        interprocedural propagation)."""
+        _, origins, truncated = _backward_slice(arg_vn, program, max_steps)
+        returns: list[tuple] = []
+        param_idxs: set[int] = set()
+        for o in origins:
+            kind = o.get("kind")
+            if kind == "call_result":
+                c = o.get("callee")
+                if c and _normalize_fn_name(c) in sources:
+                    returns.append((_normalize_fn_name(c), o.get("address")))
+            elif kind == "parameter" and o.get("param_index") is not None:
+                param_idxs.add(int(o["param_index"]))
+        outbufs: list[tuple] = []
+        if src_bufs:
+            argkeys = _buffer_keys_expanded(arg_vn, stack_syms)
+            if argkeys:
+                for sb in src_bufs:
+                    if sb["keys"] & argkeys:
+                        outbufs.append((sb["name"], sb["off"]))
+        return returns, outbufs, param_idxs, origins, truncated
+
+    def _interproc_taint(
+        self, program: Any, iface: Any, state: dict[str, Any], fn: Any,
+        param_idx: int, ip_depth: int, sources: set[str], max_steps: int, timeout: int,
+    ) -> list[dict[str, Any]]:
+        """Walk UP the call graph from (fn, param_idx): at each caller, the
+        actual argument passed for that parameter is checked for a source origin
+        (return value or out-buffer written before the call); if it instead
+        derives from the caller's OWN parameter, recurse one frame higher,
+        bounded by ip_depth. Conservative — it relies on the decompiler's own
+        arg/param model, so imperfect signatures cause MISSES, not false chains."""
+        fm = program.getFunctionManager()
+        rm = program.getReferenceManager()
+        results: list[dict[str, Any]] = []
+        work: list[tuple] = [(fn, param_idx, ip_depth, [])]
+        visited: set[tuple] = set()
+        while work:
+            cur_fn, pidx, depth, path = work.pop()
+            vkey = (int(cur_fn.getEntryPoint().getOffset()), pidx)
+            if vkey in visited:
+                continue
+            visited.add(vkey)
+            for ref in rm.getReferencesTo(cur_fn.getEntryPoint()):
+                if not ref.getReferenceType().isCall():
+                    continue
+                from_addr = ref.getFromAddress()
+                from_off = int(from_addr.getOffset())
+                caller = fm.getFunctionContaining(from_addr)
+                if caller is None:
+                    continue
+                high = self._decompile(iface, caller, timeout, state)
+                if high is None:
+                    continue
+                call_op = self._find_call_op(high, from_off)
+                if call_op is None:
+                    continue
+                cin = list(call_op.getInputs())
+                slot = pidx + 1  # input[0] is the call target
+                if slot >= len(cin):
+                    continue  # decompiler didn't model that arg -> conservative miss
+                src_bufs, stack_syms = self._function_src_bufs(program, high, sources)
+                returns, outbufs, pidxs, _, _ = self._arg_taint_origins(
+                    program, high, cin[slot], sources, src_bufs, stack_syms, max_steps
+                )
+                frame = f"{caller.getName()}@0x{from_off:x}"
+                for sname, saddr in returns:
+                    results.append({
+                        "source": sname, "source_at": saddr,
+                        "via": "return_value", "frames": path + [frame],
+                    })
+                for sname, soff in outbufs:
+                    if soff >= from_off:
+                        continue  # source must write the buffer before passing it
+                    results.append({
+                        "source": sname, "source_at": f"0x{soff:x}",
+                        "via": "out_buffer", "frames": path + [frame],
+                    })
+                if depth > 0:
+                    for pj in pidxs:
+                        work.append((caller, pj, depth - 1, path + [frame]))
+        return results
+
     def _op_taint_forward(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
-        """Forward taint (intraprocedural): report source->sink chains within
-        one function, two ways. (a) return_value: a sink arg backward-slices to
-        a source call's return value. (b) out_buffer: a sink arg refers to a
-        buffer a preceding source call WROTE via an out-parameter (read/recv/
-        fgets/getline/...). Cross-function propagation is still NOT modeled, so
-        0 chains is not an all-clear."""
+        """Forward taint: report source->sink chains. Intraprocedural by default,
+        two ways: (a) return_value — a sink arg backward-slices to a source
+        call's return value; (b) out_buffer — a sink arg refers to a buffer a
+        preceding source call WROTE via an out-parameter (read/recv/fgets/
+        getline/...). With interprocedural=True it also follows a sink arg that
+        derives from a parameter UP the call graph (bounded by ip_depth) to a
+        source in an ancestor frame, emitting a chain with the frame `path`.
+        Cross-function propagation off => 0 chains is still not an all-clear."""
         handle = self.targets.resolve(params.get("target") or target, required=True)
         assert handle is not None
         program = handle.program
@@ -2734,6 +2924,8 @@ class GhxBridge:
         scope_fn = params.get("function")
         max_steps = int(params.get("max_steps", 400))
         timeout = int(params.get("timeout", 60))
+        interprocedural = bool(params.get("interprocedural"))
+        ip_depth = int(params.get("ip_depth", 3))
 
         fm = program.getFunctionManager()
         rm = program.getReferenceManager()
@@ -2751,6 +2943,12 @@ class GhxBridge:
                 caller = fm.getFunctionContaining(from_addr)
                 if caller is None:
                     continue
+                # A thunk's body is just the trampoline branch to its target —
+                # not a real sink use site. Skipping it avoids a spurious
+                # (duplicate) chain through the sink's own .plt thunk, which
+                # interprocedural propagation would otherwise walk up.
+                if caller.isThunk():
+                    continue
                 key = int(caller.getEntryPoint().getOffset())
                 entry = sink_sites.setdefault(key, {"fn": caller, "sites": []})
                 entry["sites"].append((int(from_addr.getOffset()), sink_norm))
@@ -2762,106 +2960,107 @@ class GhxBridge:
 
         chains: list[dict[str, Any]] = []
         scanned = 0
-        for info in sink_sites.values():
-            caller = info["fn"]
-            scanned += 1
-            try:
-                with self._high_function(program, caller, timeout) as high:
-                    stack_syms = _stack_symbol_map(high)
-
-                    # Source out-buffer sites in this function: where a source
-                    # WRITES a buffer (read/recv/fgets/getline/...), keyed so a
-                    # later sink argument referring to the same buffer matches.
-                    src_bufs: list[dict[str, Any]] = []
-                    op_it = high.getPcodeOps()
-                    while op_it.hasNext():
-                        op = op_it.next()
-                        if str(op.getMnemonic()) not in ("CALL", "CALLIND"):
-                            continue
-                        callee = _callop_callee_name(program, op)
-                        if callee not in sources:
-                            continue
-                        buf_idx = _TAINT_SOURCE_OUTBUF.get(callee)
-                        if buf_idx is None:
-                            continue
-                        op_inputs = list(op.getInputs())
-                        slot = buf_idx + 1  # input[0] is the call target
-                        if slot >= len(op_inputs):
-                            continue
-                        keys = _buffer_keys(op_inputs[slot], stack_syms)
-                        if keys:
-                            src_bufs.append({
-                                "name": callee,
-                                "off": int(op.getSeqnum().getTarget().getOffset()),
-                                "keys": keys,
-                            })
-
-                    seen_out: set[tuple] = set()
-                    for call_off, sink_name in info["sites"]:
-                        call_op = self._find_call_op(high, call_off)
-                        if call_op is None:
-                            continue
-                        inputs = list(call_op.getInputs())
-                        for arg_idx in range(1, len(inputs)):
-                            # (a) return-value chains: sink arg backward-slices
-                            # to a source CALL's return value.
-                            _, origins, truncated = _backward_slice(
-                                inputs[arg_idx], program, max_steps
-                            )
-                            for o in origins:
-                                callee = o.get("callee")
-                                if o.get("kind") == "call_result" and callee and \
-                                        _normalize_fn_name(callee) in sources:
-                                    chains.append(
-                                        {
-                                            "function": _func_brief(caller),
-                                            "source": callee,
-                                            "source_at": o.get("address"),
-                                            "sink": sink_name,
-                                            "sink_at": f"0x{call_off:x}",
-                                            "arg": arg_idx - 1,
-                                            "via": "return_value",
-                                            "origins": origins,
-                                            "truncated": truncated,
-                                        }
+        ip_state = {"cache": {}, "decompiles": 0, "cap": 400}
+        ip_cm = self._decompiler(program) if interprocedural else contextlib.nullcontext()
+        with ip_cm as ip_iface:
+            for info in sink_sites.values():
+                caller = info["fn"]
+                scanned += 1
+                try:
+                    with self._high_function(program, caller, timeout) as high:
+                        src_bufs, stack_syms = self._function_src_bufs(
+                            program, high, sources
+                        )
+                        seen_out: set[tuple] = set()
+                        seen_ip: set[tuple] = set()
+                        for call_off, sink_name in info["sites"]:
+                            call_op = self._find_call_op(high, call_off)
+                            if call_op is None:
+                                continue
+                            inputs = list(call_op.getInputs())
+                            for arg_idx in range(1, len(inputs)):
+                                returns, outbufs, param_idxs, origins, truncated = \
+                                    self._arg_taint_origins(
+                                        program, high, inputs[arg_idx], sources,
+                                        src_bufs, stack_syms, max_steps,
                                     )
-                            # (b) out-buffer chains: the sink arg refers to a
-                            # buffer a PRECEDING source call wrote (ordering is
-                            # an intraprocedural heuristic: source_addr < sink).
-                            if src_bufs:
-                                argkeys = _buffer_keys_expanded(
-                                    inputs[arg_idx], stack_syms
-                                )
-                                if argkeys:
-                                    for sb in src_bufs:
-                                        if sb["off"] >= call_off:
-                                            continue
-                                        if not (sb["keys"] & argkeys):
-                                            continue
-                                        dedup = (sb["off"], call_off, arg_idx - 1)
-                                        if dedup in seen_out:
-                                            continue
-                                        seen_out.add(dedup)
-                                        chains.append({
-                                            "function": _func_brief(caller),
-                                            "source": sb["name"],
-                                            "source_at": f"0x{sb['off']:x}",
-                                            "sink": sink_name,
-                                            "sink_at": f"0x{call_off:x}",
-                                            "arg": arg_idx - 1,
-                                            "via": "out_buffer",
-                                        })
-            except OperationFailure:
-                # A decompile failure on one function must not abort the scan.
-                continue
+                                # (a) intra return_value chains.
+                                for sname, saddr in returns:
+                                    chains.append({
+                                        "function": _func_brief(caller),
+                                        "source": sname,
+                                        "source_at": saddr,
+                                        "sink": sink_name,
+                                        "sink_at": f"0x{call_off:x}",
+                                        "arg": arg_idx - 1,
+                                        "via": "return_value",
+                                        "origins": origins,
+                                        "truncated": truncated,
+                                    })
+                                # (b) intra out_buffer chains: a preceding source
+                                # call wrote this buffer (source_addr < sink).
+                                for sname, soff in outbufs:
+                                    if soff >= call_off:
+                                        continue
+                                    dedup = (soff, call_off, arg_idx - 1)
+                                    if dedup in seen_out:
+                                        continue
+                                    seen_out.add(dedup)
+                                    chains.append({
+                                        "function": _func_brief(caller),
+                                        "source": sname,
+                                        "source_at": f"0x{soff:x}",
+                                        "sink": sink_name,
+                                        "sink_at": f"0x{call_off:x}",
+                                        "arg": arg_idx - 1,
+                                        "via": "out_buffer",
+                                    })
+                                # (c) interprocedural: the sink arg derives from a
+                                # parameter — follow it up the call graph.
+                                if interprocedural and param_idxs:
+                                    for pidx in param_idxs:
+                                        for r in self._interproc_taint(
+                                            program, ip_iface, ip_state, caller,
+                                            pidx, ip_depth, sources, max_steps, timeout,
+                                        ):
+                                            dk = (r["source"], r.get("source_at"),
+                                                  call_off, arg_idx - 1, r["via"])
+                                            if dk in seen_ip:
+                                                continue
+                                            seen_ip.add(dk)
+                                            chains.append({
+                                                "function": _func_brief(caller),
+                                                "source": r["source"],
+                                                "source_at": r.get("source_at"),
+                                                "sink": sink_name,
+                                                "sink_at": f"0x{call_off:x}",
+                                                "arg": arg_idx - 1,
+                                                "via": r["via"],
+                                                "interprocedural": True,
+                                                "ip_depth": len(r["frames"]),
+                                                "path": [f"{caller.getName()}@0x{call_off:x}"]
+                                                + r["frames"],
+                                            })
+                except OperationFailure:
+                    # A decompile failure on one function must not abort the scan.
+                    continue
 
         sink_callsite_count = sum(len(info["sites"]) for info in sink_sites.values())
-        note = (
-            "intraprocedural: sink arg -> source-call return_value OR a source "
-            "out_buffer (read/recv/fgets/getline/..) written before the sink, "
-            "within one function; cross-function propagation is NOT modeled, so "
-            "0 chains is not an all-clear."
-        )
+        if interprocedural:
+            note = (
+                "interprocedural: sink arg -> source return_value/out_buffer in "
+                "this function, OR (following a parameter up to ip_depth frames) "
+                "a source in an ancestor frame. Bounded by the decompiler's "
+                "arg/param model, so missed signatures under-report rather than "
+                "fabricate; 0 chains is not an all-clear."
+            )
+        else:
+            note = (
+                "intraprocedural: sink arg -> source-call return_value OR a source "
+                "out_buffer (read/recv/fgets/getline/..) written before the sink, "
+                "within one function; cross-function propagation is NOT modeled "
+                "(pass interprocedural=true), so 0 chains is not an all-clear."
+            )
         if scope_fn and sink_callsite_count == 0:
             note = (
                 f"function {scope_fn!r} contains no calls to any configured sink "
@@ -2871,7 +3070,7 @@ class GhxBridge:
         # signal-burying problem is the *size* of the sources/sinks echo. Render
         # them as compact single-line strings (one line each, not ~20-line
         # arrays) so they no longer dominate a `| tail`.
-        return {
+        result = {
             "chain_count": len(chains),
             "chains": chains,
             "scanned_functions": scanned,
@@ -2882,6 +3081,10 @@ class GhxBridge:
             "sources_used": ", ".join(sorted(sources)),
             "sinks_used": ", ".join(sorted(sinks)),
         }
+        if interprocedural:
+            result["interprocedural"] = True
+            result["ip_depth"] = ip_depth
+        return result
 
     def _resolve_slice_start(
         self, high: Any, program: Any, at: Any, arg: Any, var_name: Any
@@ -3812,6 +4015,13 @@ def _varnode_desc(vn: Any, program: Any = None) -> dict[str, Any] | None:
         d["kind"] = "unique"
     elif vn.isAddress():
         d["kind"] = "ram"
+        if program is not None:
+            try:
+                sym = program.getSymbolTable().getPrimarySymbol(vn.getAddress())
+                if sym is not None:
+                    d["symbol"] = str(sym.getName())
+            except Exception:
+                pass
     else:
         d["kind"] = "other"
     # High-variable name, if present (high p-code form).
@@ -3868,6 +4078,51 @@ def _high_pcode_desc(op: Any, program: Any = None) -> dict[str, Any] | None:
     return _pcode_desc(op, off, 0, program)
 
 
+def _signed_hex(v: int) -> str:
+    """Render a (possibly 64-bit-unsigned) offset as a signed hex literal."""
+    if v >= (1 << 63):
+        v -= 1 << 64
+    return f"-0x{-v:x}" if v < 0 else f"0x{v:x}"
+
+
+def _fmt_vn(d: dict[str, Any] | None) -> str:
+    """Render a varnode descriptor as a readable token, preferring the SSA
+    HighVariable name, then a resolved register/symbol name, over the raw
+    (space, offset, size) tuple that Ghidra's PcodeOp.toString emits."""
+    if d is None:
+        return "---"
+    kind = d.get("kind")
+    if kind == "const":
+        return f"#{d.get('value')}"
+    if d.get("var"):
+        return str(d["var"])
+    if kind == "register":
+        return str(d.get("register") or f"reg+{d.get('offset')}")
+    if kind == "unique":
+        off = d.get("offset")
+        return f"u{off:x}" if isinstance(off, int) else f"u:{off}"
+    if kind == "ram":
+        if d.get("symbol"):
+            return str(d["symbol"])
+        off = d.get("offset")
+        return f"0x{off:x}" if isinstance(off, int) else f"ram:{off}"
+    off = d.get("offset")
+    space = d.get("space", "?")
+    if isinstance(off, int):
+        return f"{space}[{_signed_hex(off)}]"
+    return f"{space}:{off}"
+
+
+def _format_pcode_line(desc: dict[str, Any]) -> str:
+    """Format a structured p-code descriptor as ``out = OP a, b`` with named
+    varnodes — the readable analogue of Ghidra's raw PcodeOp.toString()."""
+    out = desc.get("output")
+    ins = ", ".join(_fmt_vn(v) for v in (desc.get("inputs") or []))
+    lhs = f"{_fmt_vn(out)} = " if out is not None else ""
+    body = f"{lhs}{desc.get('op')}"
+    return f"{body} {ins}" if ins else body
+
+
 def _classify_leaf(vn: Any, program: Any) -> dict[str, Any]:
     """Classify a backward-slice frontier leaf (a varnode with no SSA def)."""
     out: dict[str, Any] = {"varnode": _varnode_desc(vn, program)}
@@ -3883,6 +4138,10 @@ def _classify_leaf(vn: Any, program: Any) -> dict[str, Any]:
                 out["name"] = str(sym.getName())
                 if sym.isParameter():
                     out["kind"] = "parameter"
+                    try:
+                        out["param_index"] = int(sym.getCategoryIndex())
+                    except Exception:
+                        pass
                     return out
                 if sym.isGlobal():
                     out["kind"] = "global"

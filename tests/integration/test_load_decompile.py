@@ -656,7 +656,11 @@ void f_stack_array(FILE *fp){char buf[128],dst[128];fgets(buf,sizeof buf,fp);str
 void f_heap_ptr(int fd){char *buf=malloc(256),dst[256];read(fd,buf,256);memcpy(dst,buf,100);puts(dst);}
 void f_getline(FILE *fp){char *line=NULL,dst[256];size_t n=0;getline(&line,&n,fp);strcpy(dst,line);puts(dst);free(line);}
 void f_no_chain(FILE *fp){char a[128],b[128],dst[128];fgets(a,sizeof a,fp);memset(b,0,sizeof b);strcpy(dst,b);puts(dst);}
-int main(int c,char**v){(void)c;(void)v;f_stack_array(stdin);f_heap_ptr(0);f_getline(stdin);f_no_chain(stdin);return 0;}
+/* interprocedural: getline in ip_reader -> ip_process -> ip_copy(memcpy) */
+void ip_copy(char *dst,char *src,size_t n){memcpy(dst,src,n);}
+void ip_process(char *buf){char dst[256];ip_copy(dst,buf,128);puts(dst);}
+void ip_reader(FILE *fp){char *line=NULL;size_t n=0;getline(&line,&n,fp);ip_process(line);free(line);}
+int main(int c,char**v){(void)c;(void)v;f_stack_array(stdin);f_heap_ptr(0);f_getline(stdin);f_no_chain(stdin);ip_reader(stdin);return 0;}
 """
 
 
@@ -701,6 +705,25 @@ def test_taint_forward_out_buffer_source(running_agent, tmp_path):
     # The negative control must NOT chain (source buffer != sink buffer).
     assert not by_fn.get("f_no_chain"), (
         f"false positive in f_no_chain: {by_fn.get('f_no_chain')}"
+    )
+
+    # Intraprocedural alone must NOT cross ip_reader -> ip_process -> ip_copy.
+    ip = [c for c in chains if c["function"]["name"] == "ip_copy"]
+    assert not ip, f"intraprocedural should not catch the cross-function chain: {ip}"
+
+    # With --interprocedural the getline->memcpy chain (3 frames) appears, and
+    # the negative control still does not.
+    ipres = send_request(
+        "taint_forward", params={"interprocedural": True, "ip_depth": 4},
+        target=program_id, instance_id=running_agent, timeout=120.0,
+    )["result"]
+    ipchains = [c for c in ipres["chains"] if c.get("interprocedural")]
+    ipcopy = [c for c in ipchains
+              if c["function"]["name"] == "ip_copy" and c["source"] == "getline"]
+    assert ipcopy, f"expected interprocedural getline->memcpy chain, got {ipchains}"
+    assert ipcopy[0].get("path"), "interprocedural chain should carry a frame path"
+    assert not any(c["function"]["name"] == "f_no_chain" for c in ipres["chains"]), (
+        "interprocedural must not introduce a false chain in f_no_chain"
     )
 
 

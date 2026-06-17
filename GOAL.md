@@ -207,16 +207,23 @@ concrete bn behavior to match.
   `a`, sink reads `b`) yields NO chain; and `fw-A/bin-1` still honestly reports 0
   (its only chain is interprocedural — see below). Integration test compiles its
   own fixture (skips without gcc); the honest `note` is retained.
-- [ ] **`taint forward` interprocedural.** Today intraprocedural; bn follows
-  source→sink across calls. **This is now the gating item for `fw-A/bin-1`:** its
-  only real chain — `getline` in `FUN_00400f20` → buffer passed down through
-  `FUN_00401b70`/`FUN_004015e0` → `memcpy` in `FUN_004012b0`/`FUN_004014e0` — is
-  INTERprocedural (NO function in bin-1 calls both a source and a sink, verified).
-  The out-buffer design's assumption that intraprocedural matching would catch
-  getline→…→memcpy was wrong; catching it needs interprocedural propagation
-  (mirror `trace --interprocedural --ip-depth`) layered on the out_buffer origin,
-  and must contend with imperfect callee signature recovery (the decompiler shows
-  `FUN_00401b70(iVar4)`). Keep the no-false-chain bar.
+- [x] **`taint forward` interprocedural.** DONE + verified on a fixture, with a
+  documented decompiler-limited miss on bin-1. `taint forward --interprocedural
+  [--ip-depth N]` (default 3): when a sink arg derives from a PARAMETER, it walks
+  UP the call graph — at each caller mapping the parameter to the actual arg and
+  re-checking for a source (return_value or out_buffer) — and emits a chain with
+  the frame `path`. Conservative by construction: it uses the decompiler's own
+  arg/param model, so missed signatures UNDER-report rather than fabricate. Also
+  fixed a thunk-trampoline duplicate (sink-site discovery now skips thunk bodies).
+  **Verified** on a built 3-frame fixture (`getline` in `ip_reader` → `ip_process`
+  → `ip_copy`'s `memcpy`): caught with the full path, negative control still
+  clean. **bin-1 honestly reports 0** even interprocedurally — ROOT CAUSE: the
+  decompiler recovered the `FUN_004015e0 → FUN_004012b0 @0x401634` call site as
+  taking **0 arguments** (`nargs=0`) though the callee is `FUN_004012b0(char *)`
+  and its `memcpy` copies that very `param_1`. With no parameter seam at that
+  frame there is nothing to follow — a Ghidra calling-convention/signature
+  recovery limitation, NOT a taint bug. Closing it needs deeper param-ID analysis
+  (see `decompile --force-analysis`) or register-level taint, both out of scope.
 - [x] **`taint forward` output shape.** JSON is key-sorted (so `chain_count`/
   `chains` already lead); the real problem was the *size* of the sources/sinks
   echo. Now rendered as compact single-line strings + explicit
@@ -369,6 +376,17 @@ already loaded speeds the loop. Keep all captured artifacts under `.dogfood/`.
 
 ## Progress ledger (append one line per cycle — newest first)
 
+- 2026-06-17 — **VR-core: interprocedural forward taint.** `taint forward
+  --interprocedural [--ip-depth N]` follows a sink arg that derives from a
+  parameter UP the call graph (mapping param→actual-arg at each caller) to a
+  source in an ancestor frame, emitting the frame `path`. Conservative (uses the
+  decompiler's arg/param model → misses, never false chains). Fixed a
+  thunk-trampoline duplicate (skip thunk bodies in sink-site discovery). Verified
+  on a built 3-frame fixture (getline→…→memcpy caught with path; negative control
+  clean). bin-1 honestly reports 0: the decompiler recovered the key call site
+  `FUN_004015e0→FUN_004012b0` as `nargs=0`, so there's no parameter seam to
+  follow — a Ghidra signature-recovery limit, not a bug. +2 parser cases,
+  integration test extended; 181 unit green.
 - 2026-06-17 — **VR-core: forward-taint out-buffer source (intraprocedural).**
   `taint forward` now treats a source's written out-buffer as a taint origin
   (out-arg map: read/recv=arg1, fgets/fread=arg0, getline/getdelim=arg0 char**),

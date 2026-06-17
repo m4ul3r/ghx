@@ -1194,13 +1194,22 @@ def cmd_function_info(ns: argparse.Namespace) -> int:
         arg("--form", choices=("raw", "high"), default="raw",
             help="raw p-code per instruction, or high p-code from decompiler "
                  "(SSA form; the Ghidra analogue of bn's --ssa hlil/mlil)"),
+        arg("--raw", action="store_true",
+            help="Emit Ghidra's unformatted PcodeOp dump (raw varnode tuples) "
+                 "instead of the named, formatted p-code"),
+        arg("--indirect", action="store_true",
+            help="Show INDIRECT call/store side-effect ops in high p-code "
+                 "(hidden by default; always present in --format json ops[])"),
         arg("--lines", default=None, metavar="START:END",
             help="Slice the output to lines START:END (1-indexed; either endpoint optional)"),
     ],
 )
 def cmd_il(ns: argparse.Namespace) -> int:
     try:
-        response = _send("il", ns, identifier=ns.identifier, form=ns.form)
+        response = _send(
+            "il", ns, identifier=ns.identifier, form=ns.form,
+            raw=ns.raw, indirect=ns.indirect,
+        )
     except BridgeError as exc:
         print(f"ghx il: {exc}", file=sys.stderr)
         return 1
@@ -1210,7 +1219,9 @@ def cmd_il(ns: argparse.Namespace) -> int:
         result["text"] = _slice_lines(result.get("text", ""), ns.lines)
     _emit(
         result, ns,
-        text_renderer=lambda r, o: _render_function_text(r, o, f"  (form={r.get('form')})"),
+        text_renderer=lambda r, o: _render_function_text(
+            r, o, f"  (form={r.get('form')}{', raw' if r.get('raw') else ''})"
+        ),
     )
     return 0
 
@@ -1936,7 +1947,8 @@ def _send_taint_backward(ns: argparse.Namespace, label: str) -> int:
 
 @command(
     "taint", "forward",
-    help="Forward taint: source->sink chains (intraprocedural v1)",
+    help="Forward taint: source->sink chains (return-value + out-buffer; "
+         "--interprocedural follows params across calls)",
     fmt="json", target=True,
     args=[
         arg("--sources", default=None,
@@ -1945,12 +1957,19 @@ def _send_taint_backward(ns: argparse.Namespace, label: str) -> int:
             help="Comma list of sink function names (default: libc danger fns)"),
         arg("--function", default=None,
             help="Restrict the scan to one function (faster)"),
+        arg("--interprocedural", action="store_true",
+            help="Follow a sink arg that comes from a parameter up the call "
+                 "graph to a source in an ancestor frame"),
+        arg("--ip-depth", type=int, default=None,
+            help="Max caller frames to cross with --interprocedural (default: 3)"),
     ],
 )
 def cmd_taint_forward(ns: argparse.Namespace) -> int:
     try:
         response = _send("taint_forward", ns, sources=ns.sources, sinks=ns.sinks,
-                         function=ns.function)
+                         function=ns.function,
+                         interprocedural=ns.interprocedural or None,
+                         ip_depth=ns.ip_depth)
     except BridgeError as exc:
         print(f"ghx taint forward: {exc}", file=sys.stderr)
         return 1
@@ -1963,11 +1982,17 @@ def cmd_taint_forward(ns: argparse.Namespace) -> int:
         for c in r.get("chains", []):
             fn = c.get("function", {})
             trunc = "  [truncated]" if c.get("truncated") else ""
+            via = c.get("via", "")
+            tag = f" via {via}" if via else ""
+            if c.get("interprocedural"):
+                tag += f" [interproc d={c.get('ip_depth')}]"
             out.write(
                 f"  {c.get('source')} @ {c.get('source_at')}  ->  "
                 f"{c.get('sink')}(arg{c.get('arg')}) @ {c.get('sink_at')}  "
-                f"in {fn.get('name')}{trunc}\n"
+                f"in {fn.get('name')}{tag}{trunc}\n"
             )
+            if c.get("path"):
+                out.write(f"      path: {' -> '.join(c['path'])}\n")
         if not r.get("chains"):
             out.write("  (no source->sink chains found)\n")
 
