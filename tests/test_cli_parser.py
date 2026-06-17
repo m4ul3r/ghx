@@ -153,8 +153,10 @@ def test_version_is_exposed(parser, capsys):
         ["taint", "forward", "--sources", "recv,read", "--sinks", "strcpy,system"],
         ["taint", "backward", "main", "--at", "0x401050", "--arg", "0"],
         ["taint", "backward", "main", "--variable", "buf"],
+        ["taint", "backward", "main", "--variable", "buf", "--max-depth", "100"],
         ["trace", "main", "--at", "0x401050"],
         ["trace", "main", "--at", "0x401050", "--arg", "1"],
+        ["trace", "main", "--at", "0x401050", "--max-depth", "25"],
     ],
 )
 def test_parser_accepts_v1_commands(parser, argv):

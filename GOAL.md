@@ -124,12 +124,15 @@ concrete bn behavior to match.
   stack/frame/link/pc registers (sp, fp, lr, pc, x29, x30, rbp/rsp/rip, …). On
   `fw-A/bin-1` it cut `sp/x29/x30` from the output, leaving the meaningful
   `x0/x1/x19/x23/x27`.
-- [ ] **`trace` depth flags.** ghx `trace` has `--arg/--at`; bn adds
-  `--max-depth`, `--view {mlil,hlil}`, `--interprocedural`, `--ip-depth`. Bring
-  these over (the SSA backward slice is the standout op — make it bn-complete).
-- [ ] **`taint backward` arg model** — verify ghx's `--at/--arg/--variable`
-  reaches semantic parity with bn's `--function/--sink/--max-depth`; add
-  `--max-depth`.
+- [~] **`trace` depth flags.** Added `--max-depth` (bounds the SSA slice;
+  verified truncation on `fw-A/bin-1`). Still TODO: `--interprocedural`/
+  `--ip-depth` (follow return values across call boundaries) — a larger item.
+  `--view {mlil,hlil}` has no clean Ghidra analogue (the slice runs on high
+  p-code only); documented as N/A rather than faked.
+- [x] **`taint backward` arg model** — added `--max-depth` (shared
+  `_send_taint_backward`, maps to the op's `max_steps`). ghx's
+  `--at/--arg/--variable` is the working analogue of bn's
+  `--function/--sink`; verified on `fw-A/bin-1`.
 
 ### P1 — listing / paging / filtering ergonomics (mechanical, recurring)
 bn gives every list command `--count`, `--limit`, `--offset`, and a query/regex.
@@ -250,6 +253,9 @@ already loaded speeds the loop. Keep all captured artifacts under `.dogfood/`.
 
 ## Progress ledger (append one line per cycle — newest first)
 
+- 2026-06-17 — `trace`/`taint backward --max-depth` (bounds the SSA slice; maps to
+  the op's max_steps). Verified truncation on `fw-A/bin-1`. trace
+  `--interprocedural` still pending. 174 green.
 - 2026-06-17 — P2 surface: `close --all`, `read --address`/`--encoding {hex,bytes}`,
   `save --path` alias. Dogfooding caught a duplicate-`close_all` method shadowing
   bug (returned None) — fixed. 172 green.

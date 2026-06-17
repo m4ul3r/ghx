@@ -1911,6 +1911,7 @@ def _send_taint_backward(ns: argparse.Namespace, label: str) -> int:
             address=getattr(ns, "at", None),
             arg=getattr(ns, "arg", None),
             variable=getattr(ns, "variable", None),
+            max_steps=getattr(ns, "max_depth", None),
         )
     except BridgeError as exc:
         print(f"ghx {label}: {exc}", file=sys.stderr)
@@ -1969,6 +1970,8 @@ def cmd_taint_forward(ns: argparse.Namespace) -> int:
         arg("--at", default=None, help="Call/sink address to slice an argument of"),
         arg("--arg", type=int, default=None, help="0-based argument index at --at"),
         arg("--variable", default=None, help="Slice a named variable instead of a call arg"),
+        arg("--max-depth", type=int, default=None,
+            help="Max SSA slice steps before truncation (default: 400)"),
     ],
 )
 def cmd_taint_backward(ns: argparse.Namespace) -> int:
@@ -1983,6 +1986,8 @@ def cmd_taint_backward(ns: argparse.Namespace) -> int:
         arg("identifier", help="Function name or entry address containing the call"),
         arg("--at", required=True, help="Call address"),
         arg("--arg", type=int, default=0, help="0-based argument index (default: 0)"),
+        arg("--max-depth", type=int, default=None,
+            help="Max SSA slice steps before truncation (default: 400)"),
     ],
 )
 def cmd_trace(ns: argparse.Namespace) -> int:
