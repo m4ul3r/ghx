@@ -138,6 +138,7 @@ def test_version_is_exposed(parser, capsys):
         ["dataflow", "defuse", "0x401000", "local_10"],
         ["dataflow", "values", "main", "0x401010"],
         ["dataflow", "values", "main", "0x401010", "--register", "RAX"],
+        ["dataflow", "values", "main", "0x401010", "--no-frame"],
         ["dataflow", "callgraph", "main"],
         ["dataflow", "callgraph", "main", "--direction", "callees", "--depth", "2"],
         ["dataflow", "callgraph", "0x401000", "--direction", "callers"],

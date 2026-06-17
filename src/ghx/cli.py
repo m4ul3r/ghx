@@ -1777,12 +1777,15 @@ def cmd_dataflow_callgraph(ns: argparse.Namespace) -> int:
         arg("identifier", help="Function name or entry address"),
         arg("address", help="Address within the function to query"),
         arg("--register", default=None, help="Restrict to one register (default: all base registers)"),
+        arg("--no-frame", action="store_true",
+            help="Drop stack/frame/link/pc registers (sp, fp, lr, pc, ...) to raise signal"),
     ],
 )
 def cmd_dataflow_values(ns: argparse.Namespace) -> int:
     try:
         response = _send("dataflow_values", ns, identifier=ns.identifier,
-                         address=ns.address, register=ns.register)
+                         address=ns.address, register=ns.register,
+                         no_frame=ns.no_frame or None)
     except BridgeError as exc:
         print(f"ghx dataflow values: {exc}", file=sys.stderr)
         return 1

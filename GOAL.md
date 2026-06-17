@@ -103,12 +103,15 @@ concrete bn behavior to match.
 - [ ] **`taint forward` interprocedural.** Today it is intraprocedural v1; bn
   follows source→sink across calls. Add interprocedural propagation (mirror
   `trace --interprocedural --ip-depth`).
-- [ ] **`taint forward` output shape.** Put `chain_count` + `chains` FIRST;
-  demote the large `sources_used`/`sinks_used` echo. Add a one-line text summary
-  for default text mode so `| tail` doesn't hide the signal.
-- [ ] **`taint forward --function` semantics.** A named function with no
-  source+sink pair is silently dropped → `scanned_functions: 0` reads like "not
-  found". Distinguish "0 functions matched filter" from "scanned, 0 chains".
+- [x] **`taint forward` output shape.** JSON is key-sorted (so `chain_count`/
+  `chains` already lead); the real problem was the *size* of the sources/sinks
+  echo. Now rendered as compact single-line strings + explicit
+  `source_count`/`sink_count`, shrinking the whole default object to ~11 lines so
+  `| tail` shows the full signal. Text mode already prints a one-line summary.
+- [x] **`taint forward --function` semantics.** Already handled: when the scoped
+  function has no sink calls the `note` says "contains no calls to any configured
+  sink (N checked) — nothing to scan", distinguishing it from "scanned, 0 chains".
+  Verified on `fw-A/bin-1`.
 - [x] **`callsites <libc-name>` thunk ambiguity.** Already resolved:
   `_op_callsites` uses `_resolve_functions` (plural) and unions call sites across
   all matched thunks/symbols, dropping thunk→EXTERNAL trampolines and returning
@@ -117,8 +120,10 @@ concrete bn behavior to match.
 - [x] **`callsites --caller-static`** — added. Text mode leads with each call's
   static return address; JSON now carries a bn-compatible `caller_static` field
   (= instruction-after-call). Verified on `fw-A/bin-1`.
-- [ ] **`dataflow values` frame-register noise.** Default dumps `sp/x29/x30`;
-  add `--args-only` / filter to non-frame regs to raise signal.
+- [x] **`dataflow values` frame-register noise.** Added `--no-frame` to drop
+  stack/frame/link/pc registers (sp, fp, lr, pc, x29, x30, rbp/rsp/rip, …). On
+  `fw-A/bin-1` it cut `sp/x29/x30` from the output, leaving the meaningful
+  `x0/x1/x19/x23/x27`.
 - [ ] **`trace` depth flags.** ghx `trace` has `--arg/--at`; bn adds
   `--max-depth`, `--view {mlil,hlil}`, `--interprocedural`, `--ip-depth`. Bring
   these over (the SSA backward slice is the standout op — make it bn-complete).
@@ -240,6 +245,10 @@ already loaded speeds the loop. Keep all captured artifacts under `.dogfood/`.
 
 ## Progress ledger (append one line per cycle — newest first)
 
+- 2026-06-17 — Friction-log signal fixes: `taint forward` sources/sinks echo now
+  compact strings (+counts) so default JSON is ~11 lines and `| tail`-safe;
+  `dataflow values --no-frame` drops sp/fp/lr/pc noise; confirmed `taint forward
+  --function` no-sink case is clearly explained in `note`. 166 green.
 - 2026-06-17 — P1 function ergonomics: `function list --count/--sort` and
   `function search --exact/--min-address/--max-address/--sort` (shared
   `_sort_func_rows`; `--exact` mutex with `--regex`). 165 green. Dogfooded.

@@ -2582,6 +2582,10 @@ class GhxBridge:
         else:
             registers = [r for r in program.getLanguage().getRegisters() if r.isBaseRegister()]
 
+        # Drop stack/frame/link/pc housekeeping registers (only meaningful in the
+        # all-registers case; an explicit --register is always honoured).
+        drop_frame = bool(params.get("no_frame")) and not reg_name
+
         mask = (1 << (8 * int(program.getDefaultPointerSize()))) - 1
         values: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -2593,6 +2597,8 @@ class GhxBridge:
             if val is None:
                 continue
             name = str(reg.getName())
+            if drop_frame and name.lower() in _FRAME_REGISTER_NAMES:
+                continue
             if name in seen:
                 continue
             seen.add(name)
@@ -2737,14 +2743,20 @@ class GhxBridge:
                 f"function {scope_fn!r} contains no calls to any configured sink "
                 f"({len(sinks)} sinks checked) — nothing to scan. " + note
             )
+        # JSON output is key-sorted, so chain_count/chains already lead; the
+        # signal-burying problem is the *size* of the sources/sinks echo. Render
+        # them as compact single-line strings (one line each, not ~20-line
+        # arrays) so they no longer dominate a `| tail`.
         return {
-            "sources_used": sorted(sources),
-            "sinks_used": sorted(sinks),
-            "scanned_functions": scanned,
-            "sink_callsite_count": sink_callsite_count,
             "chain_count": len(chains),
             "chains": chains,
+            "scanned_functions": scanned,
+            "sink_callsite_count": sink_callsite_count,
             "note": note,
+            "source_count": len(sources),
+            "sink_count": len(sinks),
+            "sources_used": ", ".join(sorted(sources)),
+            "sinks_used": ", ".join(sorted(sinks)),
         }
 
     def _resolve_slice_start(
@@ -3330,6 +3342,14 @@ class GhxBridge:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+_FRAME_REGISTER_NAMES = {
+    # AArch64 / ARM
+    "sp", "fp", "lr", "pc", "xzr", "wzr", "x29", "x30", "w29", "w30",
+    # x86 / x86-64
+    "rbp", "rsp", "rip", "ebp", "esp", "eip",
+}
 
 
 def _decoded_string_value(rep: str) -> str:
