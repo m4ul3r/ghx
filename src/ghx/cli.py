@@ -1625,6 +1625,9 @@ def cmd_types_declare(ns: argparse.Namespace) -> int:
                  "(blank and #-prefixed lines ignored)"),
         arg("--context", type=int, default=0,
             help="Include N previous and N next instructions around each call"),
+        arg("--caller-static", action="store_true",
+            help="Caller_static-first text output: lead with each call's static "
+                 "return address (for mapping a stack return address to its callsite)"),
     ],
 )
 def cmd_callsites(ns: argparse.Namespace) -> int:
@@ -1670,7 +1673,19 @@ def cmd_callsites(ns: argparse.Namespace) -> int:
             for nxt in s.get("next_ins", []) or []:
                 out.write(f"    +  {nxt['address']:>12}  {nxt.get('disasm') or ''}\n")
 
-    _emit(r, ns, text_renderer=_render)
+    def _render_caller_static(r, out):
+        callee = r["callee"]
+        out.write(f"callee  {callee['name']} @ {callee['address']}\n")
+        for s in r.get("callsites", []):
+            cs = s.get("caller_static") or s.get("return_address") or "-"
+            caller = s.get("caller") or "-"
+            out.write(
+                f"  caller_static={cs:<12}  call={s['call_addr']:<12}  "
+                f"{caller:<32}  {s.get('disasm') or ''}\n"
+            )
+
+    renderer = _render_caller_static if ns.caller_static else _render
+    _emit(r, ns, text_renderer=renderer)
     return 0
 
 

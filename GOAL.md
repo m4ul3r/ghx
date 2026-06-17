@@ -109,12 +109,14 @@ concrete bn behavior to match.
 - [ ] **`taint forward --function` semantics.** A named function with no
   source+sink pair is silently dropped → `scanned_functions: 0` reads like "not
   found". Distinguish "0 functions matched filter" from "scanned, 0 chains".
-- [ ] **`callsites <libc-name>` thunk ambiguity.** Every imported libc fn resolves
-  to ≥2 thunks (.plt + EXTERNAL), so `callsites memcpy` is *always* ambiguous on
-  a normal ELF. Auto-prefer the code/.plt thunk or aggregate callers across all
-  thunks of one symbol. Match bn, where `callsites <name>` Just Works.
-- [ ] **`callsites --caller-static`** — caller_static-first text output for
-  return-address mapping workflows (bn-only flag today).
+- [x] **`callsites <libc-name>` thunk ambiguity.** Already resolved:
+  `_op_callsites` uses `_resolve_functions` (plural) and unions call sites across
+  all matched thunks/symbols, dropping thunk→EXTERNAL trampolines and returning
+  `matched_targets`. Verified `callsites memcpy/strlen/snprintf/mount` on
+  `fw-A/bin-1` — no ambiguity error.
+- [x] **`callsites --caller-static`** — added. Text mode leads with each call's
+  static return address; JSON now carries a bn-compatible `caller_static` field
+  (= instruction-after-call). Verified on `fw-A/bin-1`.
 - [ ] **`dataflow values` frame-register noise.** Default dumps `sp/x29/x30`;
   add `--args-only` / filter to non-frame regs to raise signal.
 - [ ] **`trace` depth flags.** ghx `trace` has `--arg/--at`; bn adds
@@ -232,6 +234,9 @@ already loaded speeds the loop. Keep all captured artifacts under `.dogfood/`.
 
 ## Progress ledger (append one line per cycle — newest first)
 
+- 2026-06-17 — P1 VR-core: `callsites --caller-static` (return-address-first text
+  + bn-compatible `caller_static` JSON field). Confirmed the thunk-ambiguity
+  friction is already fixed (union across thunks, `matched_targets`). 158 green.
 - 2026-06-17 — More P1 listing ergonomics: `imports --count/--limit/--offset/
   --summary` and `sections --count/--limit/--offset`. Full suite 157 green.
   Dogfooded on `fw-A/bin-1` (summary: 28 external / 56 thunks).

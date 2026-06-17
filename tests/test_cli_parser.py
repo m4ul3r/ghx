@@ -97,6 +97,7 @@ def test_version_is_exposed(parser, capsys):
         ["callsites", "strcpy"],
         ["callsites", "strcpy", "--context", "2"],
         ["callsites", "strcpy", "--within-file", "/tmp/whitelist.txt"],
+        ["callsites", "memcpy", "--caller-static"],
         ["bundle", "function", "main"],
         ["batch", "apply", "/tmp/manifest.json"],
         ["py", "exec", "--code", "print(1)"],

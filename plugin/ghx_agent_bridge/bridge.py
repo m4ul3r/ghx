@@ -2116,13 +2116,17 @@ class GhxBridge:
                         return_addr = ins.getMaxAddress().add(1)
                     except Exception:
                         return_addr = None
+                return_str = (
+                    f"0x{int(return_addr.getOffset()):x}" if return_addr is not None else None
+                )
                 site: dict[str, Any] = {
                     "callee": callee_name,
                     "caller": caller_name,
                     "call_addr": f"0x{call_off:x}",
-                    "return_address": (
-                        f"0x{int(return_addr.getOffset()):x}" if return_addr is not None else None
-                    ),
+                    "return_address": return_str,
+                    # caller_static: the static return address (instruction after
+                    # the call) used to map a stack return address back here.
+                    "caller_static": return_str,
                     "ref_type": str(rtype),
                     "disasm": str(ins) if ins is not None else None,
                 }
