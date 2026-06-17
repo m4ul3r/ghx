@@ -145,6 +145,45 @@ def test_choose_instance_ignores_stale_pin(tmp_cache, monkeypatch):
     assert transport.choose_instance(None, auto_start=False).instance_id == "aaaa"
 
 
+def test_read_log_tail_surfaces_error_marker(tmp_path):
+    log = tmp_path / "boot.log"
+    # Java exception header printed early, then a long stack, then noise.
+    lines = ["java.lang.IllegalArgumentException: Path element starting with '.' is not permitted"]
+    lines += [f"\tat ghidra.framework.Frame{i}.run(Frame{i}.java:{i})" for i in range(40)]
+    log.write_text("\n".join(lines) + "\n")
+
+    tail = transport._read_log_tail(log)
+    # The marked exception header survives even though it's far outside the tail window.
+    assert "not permitted" in tail
+    # And the tail end (recent stack frames) is present too.
+    assert "Frame39" in tail
+
+
+def test_read_log_tail_empty_log(tmp_path):
+    log = tmp_path / "empty.log"
+    log.write_text("   \n\n")
+    assert transport._read_log_tail(log) == ""
+
+
+def test_read_log_tail_missing_file(tmp_path):
+    assert transport._read_log_tail(tmp_path / "nope.log") == ""
+
+
+def test_spawn_failure_detail_includes_tail(tmp_path):
+    log = tmp_path / "boot.log"
+    log.write_text("Traceback (most recent call last):\nRuntimeError: boom\n")
+    detail = transport._spawn_failure_detail(log)
+    assert "RuntimeError: boom" in detail
+    assert str(log) in detail
+
+
+def test_spawn_failure_detail_falls_back_when_empty(tmp_path):
+    log = tmp_path / "empty.log"
+    log.write_text("")
+    detail = transport._spawn_failure_detail(log)
+    assert detail == f" Check {log}"
+
+
 def test_purges_stale_registry_when_socket_missing(tmp_cache):
     # Write a registry pointing at a socket that doesn't exist.
     sock_path = tmp_cache / "instances" / "stale.sock"

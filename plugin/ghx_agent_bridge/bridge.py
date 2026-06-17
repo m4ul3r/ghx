@@ -1078,6 +1078,8 @@ class GhxBridge:
         identifier = params.get("identifier")
         if identifier is None:
             raise OperationFailure("bad_request", "xrefs requires 'identifier'")
+        offset = int(params.get("offset", 0))
+        limit = int(params["limit"]) if params.get("limit") is not None else None
         program = handle.program
 
         try:
@@ -1118,24 +1120,42 @@ class GhxBridge:
                 }
             )
 
+        code_refs.sort(key=lambda r: int(r["address"], 16))
+        incoming_total = len(code_refs)
+        paged = code_refs[offset:]
+        if limit is not None:
+            paged = paged[:limit]
+
         return {
             "target": f"0x{off:x}",
-            "incoming": code_refs,
+            "incoming": paged,
+            "incoming_total": incoming_total,
             "outgoing": outgoing,
         }
 
-    def _op_strings(self, params: dict[str, Any], target: str | None) -> list[dict[str, Any]]:
+    def _op_strings(self, params: dict[str, Any], target: str | None):
         from ghidra.program.util import DefinedStringIterator  # type: ignore
 
         handle = self.targets.resolve(params.get("target") or target, required=True)
         assert handle is not None
         query = params.get("query")
-        needle = str(query).lower() if query else None
+        use_regex = bool(params.get("regex"))
+        pattern = None
+        needle = None
+        if query is not None:
+            if use_regex:
+                try:
+                    pattern = re.compile(str(query), re.IGNORECASE)
+                except re.error as exc:
+                    raise ValueError(f"invalid --regex pattern: {exc}")
+            else:
+                needle = str(query).lower()
         section_filter = params.get("section")
         section_needle = str(section_filter) if section_filter else None
         min_len = int(params.get("min_length", 1))
         offset = int(params.get("offset", 0))
         limit = int(params["limit"]) if params.get("limit") is not None else None
+        want_count = bool(params.get("count"))
 
         program = handle.program
         memory = program.getMemory()
@@ -1149,7 +1169,14 @@ class GhxBridge:
             length = int(data.getLength())
             if length < min_len:
                 continue
-            if needle and needle not in value.lower():
+            # Match against the decoded string content, not Ghidra's C-literal
+            # representation (e.g. `u8"libc.so.6"`), so anchored regexes and
+            # substring queries behave intuitively.
+            content = _decoded_string_value(value)
+            if pattern is not None:
+                if not pattern.search(content):
+                    continue
+            elif needle and needle not in content.lower():
                 continue
             addr = data.getAddress()
             off = int(addr.getOffset())
@@ -1166,6 +1193,8 @@ class GhxBridge:
                 }
             )
         rows.sort(key=lambda row: int(row["address"], 16))
+        if want_count:
+            return {"count": len(rows)}
         if offset:
             rows = rows[offset:]
         if limit is not None:
@@ -3243,6 +3272,24 @@ class GhxBridge:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _decoded_string_value(rep: str) -> str:
+    """Strip Ghidra's C-literal decoration from a string representation.
+
+    `getDefaultValueRepresentation()` yields things like ``"libc.so.6"`` or
+    ``u8"libc.so.6"`` (encoding prefix + surrounding quotes). For querying we
+    want the bare content so that substring filters and anchored regexes match
+    the actual string, not the decoration.
+    """
+    s = rep
+    for pfx in ("u8", "U", "L", "u"):
+        if s.startswith(pfx + '"'):
+            s = s[len(pfx):]
+            break
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1]
+    return s
 
 
 def _surrounding_instructions(listing: Any, base_ins: Any, n: int) -> list[dict[str, Any]]:

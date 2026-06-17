@@ -1238,7 +1238,7 @@ def cmd_read(ns: argparse.Namespace) -> int:
 
 @command(
     "xrefs", help="Cross-references to an address, symbol, or struct field",
-    target=True,
+    target=True, paged=True,
     args=[
         arg("identifier", nargs="?",
             help="Address or symbol; omit when using --field"),
@@ -1275,6 +1275,15 @@ def cmd_xrefs(ns: argparse.Namespace) -> int:
             print(f"ghx xrefs: {exc}", file=sys.stderr)
             return 1
         result = response["result"]
+        # The field scan computes all refs up front; apply --offset/--limit
+        # client-side so paging is uniform with the address/symbol path.
+        if ns.offset or ns.limit is not None:
+            all_refs = result.get("code_refs", []) or []
+            result["code_refs_total"] = len(all_refs)
+            sliced = all_refs[ns.offset:]
+            if ns.limit is not None:
+                sliced = sliced[: ns.limit]
+            result["code_refs"] = sliced
 
         def _render_field(r, out):
             f = r.get("field", {})
@@ -1285,7 +1294,9 @@ def cmd_xrefs(ns: argparse.Namespace) -> int:
             )
             out.write(f"scanned   {r.get('scanned_functions')} function(s)\n")
             refs = r.get("code_refs", [])
-            out.write(f"code_refs ({len(refs)})\n")
+            total = r.get("code_refs_total")
+            shown = f"{len(refs)} of {total}" if total is not None else str(len(refs))
+            out.write(f"code_refs ({shown})\n")
             for x in refs:
                 out.write(
                     f"  {x['address']:>12}  {x['function']:<32}  "
@@ -1299,7 +1310,8 @@ def cmd_xrefs(ns: argparse.Namespace) -> int:
         print("ghx xrefs: provide an identifier or use --field", file=sys.stderr)
         return 2
     try:
-        response = _send("xrefs", ns, identifier=ns.identifier)
+        response = _send("xrefs", ns, identifier=ns.identifier,
+                         offset=ns.offset, limit=ns.limit)
     except BridgeError as exc:
         print(f"ghx xrefs: {exc}", file=sys.stderr)
         return 1
@@ -1309,7 +1321,9 @@ def cmd_xrefs(ns: argparse.Namespace) -> int:
         out.write(f"target   {r.get('target')}\n")
         incoming = r.get("incoming", []) or []
         outgoing = r.get("outgoing", []) or []
-        out.write(f"incoming ({len(incoming)})\n")
+        total = r.get("incoming_total")
+        shown = f"{len(incoming)} of {total}" if total is not None and total != len(incoming) else str(len(incoming))
+        out.write(f"incoming ({shown})\n")
         for x in incoming:
             func = x.get("function") or "-"
             out.write(
@@ -1358,29 +1372,52 @@ def _looks_like_crt_noise(row: dict[str, Any]) -> bool:
     target=True, paged=True,
     args=[
         arg("--query", default=None, help="substring filter (case-insensitive)"),
+        arg("--regex", action="store_true",
+            help="Interpret --query as a case-insensitive regular expression"),
         arg("--min-length", type=int, default=1),
         arg("--section", default=None,
             help="Restrict to a specific section name (e.g. .rodata)"),
         arg("--no-crt", action="store_true",
             help="Heuristically drop CRT/locale/runtime noise strings"),
+        arg("--count", action="store_true",
+            help="Show the matching string count instead of listing"),
     ],
 )
 def cmd_strings(ns: argparse.Namespace) -> int:
+    # `--no-crt` is a client-side heuristic, so when it's combined with --count
+    # we must fetch the full matching set and count after filtering; otherwise
+    # the daemon can count directly and skip transferring the bodies.
+    bridge_count = ns.count and not ns.no_crt
     try:
         response = _send(
             "strings", ns,
             query=ns.query,
+            regex=ns.regex or None,
             min_length=ns.min_length,
             section=ns.section,
-            offset=ns.offset,
-            limit=ns.limit,
+            offset=None if ns.count else ns.offset,
+            limit=None if ns.count else ns.limit,
+            count=bridge_count or None,
         )
     except BridgeError as exc:
         print(f"ghx strings: {exc}", file=sys.stderr)
         return 1
-    rows = response["result"] or []
+    result = response["result"]
+
+    def _render_count(payload, out):
+        out.write(f"{payload.get('count', 0)} strings\n")
+
+    if bridge_count:
+        payload = result if isinstance(result, dict) else {"count": len(result or [])}
+        _emit(payload, ns, text_renderer=_render_count)
+        return 0
+
+    rows = result or []
     if ns.no_crt:
         rows = [r for r in rows if not _looks_like_crt_noise(r)]
+    if ns.count:  # --count combined with --no-crt: count the filtered rows
+        _emit({"count": len(rows)}, ns, text_renderer=_render_count)
+        return 0
 
     def _render(rows, out):
         for r in rows:
