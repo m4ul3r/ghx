@@ -1146,7 +1146,10 @@ def cmd_function_info(ns: argparse.Namespace) -> int:
     args=[
         arg("identifier"),
         arg("--form", choices=("raw", "high"), default="raw",
-            help="raw p-code per instruction, or high p-code from decompiler (SSA-like)"),
+            help="raw p-code per instruction, or high p-code from decompiler "
+                 "(SSA form; the Ghidra analogue of bn's --ssa hlil/mlil)"),
+        arg("--lines", default=None, metavar="START:END",
+            help="Slice the output to lines START:END (1-indexed; either endpoint optional)"),
     ],
 )
 def cmd_il(ns: argparse.Namespace) -> int:
@@ -1155,8 +1158,12 @@ def cmd_il(ns: argparse.Namespace) -> int:
     except BridgeError as exc:
         print(f"ghx il: {exc}", file=sys.stderr)
         return 1
+    result = response["result"]
+    if ns.lines:
+        result = dict(result)
+        result["text"] = _slice_lines(result.get("text", ""), ns.lines)
     _emit(
-        response["result"], ns,
+        result, ns,
         text_renderer=lambda r, o: _render_function_text(r, o, f"  (form={r.get('form')})"),
     )
     return 0
@@ -1164,7 +1171,11 @@ def cmd_il(ns: argparse.Namespace) -> int:
 
 @command(
     "disasm", help="Dump a function's disassembly", target=True,
-    args=[arg("identifier")],
+    args=[
+        arg("identifier"),
+        arg("--lines", default=None, metavar="START:END",
+            help="Slice the output to lines START:END (1-indexed; either endpoint optional)"),
+    ],
 )
 def cmd_disasm(ns: argparse.Namespace) -> int:
     try:
@@ -1172,7 +1183,11 @@ def cmd_disasm(ns: argparse.Namespace) -> int:
     except BridgeError as exc:
         print(f"ghx disasm: {exc}", file=sys.stderr)
         return 1
-    _emit(response["result"], ns, text_renderer=_render_function_text)
+    result = response["result"]
+    if ns.lines:
+        result = dict(result)
+        result["text"] = _slice_lines(result.get("text", ""), ns.lines)
+    _emit(result, ns, text_renderer=_render_function_text)
     return 0
 
 

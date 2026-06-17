@@ -152,10 +152,12 @@ ghx is missing these in several places:
   workflow is equivalent or align the surface.
 
 ### P1 — IL / decompile / disasm slicing
-- [ ] `il`: add `--lines START:END` slicing and `--ssa`; map bn `--view
-  {hlil,mlil,llil}` onto ghx's p-code ladder (today only `--form`). Document the
-  mapping in the help text.
-- [ ] `disasm`: add `--lines START:END`.
+- [x] `il`: added `--lines START:END` slicing (keeps large IL inline instead of
+  spilling). `--form high` is documented as the Ghidra analogue of bn's
+  `--ssa hlil/mlil` (Ghidra high p-code is already SSA). A literal `--view`/
+  `--ssa` alias remains a small naming follow-up.
+- [x] `disasm`: added `--lines START:END`. Verified on `fw-A/bin-1` (sliced
+  output stays inline; full disasm JSON otherwise spills at ~30KB).
 - [ ] `function structured-il`: align `--form` with bn's `--view` + `--no-ssa`.
 - [ ] `decompile`: bn has `--force-analysis` (override Ghidra's skip on huge
   funcs and reanalyze). ghx has `--timeout`; add `--force-analysis` equivalent.
@@ -234,6 +236,8 @@ already loaded speeds the loop. Keep all captured artifacts under `.dogfood/`.
 
 ## Progress ledger (append one line per cycle — newest first)
 
+- 2026-06-17 — P1 IL slicing: `il --lines` and `disasm --lines` (CLI-side, reuses
+  `_slice_lines`). Keeps large IL/disasm inline instead of spilling. 160 green.
 - 2026-06-17 — P1 VR-core: `callsites --caller-static` (return-address-first text
   + bn-compatible `caller_static` JSON field). Confirmed the thunk-ambiguity
   friction is already fixed (union across thunks, `matched_targets`). 158 green.
