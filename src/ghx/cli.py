@@ -783,18 +783,27 @@ def cmd_load(ns: argparse.Namespace) -> int:
     return 0
 
 
-@command("close", help="Release a loaded program", target=True)
+@command("close", help="Release a loaded program", target=True,
+         args=[arg("--all", action="store_true", help="Close all loaded programs")])
 def cmd_close(ns: argparse.Namespace) -> int:
     try:
         response = _send(
             "close_binary", ns,
             selector=ns.target,
+            all=ns.all or None,
         )
     except BridgeError as exc:
         print(f"ghx close: {exc}", file=sys.stderr)
         return 1
-    _emit(response["result"], ns,
-          text_renderer=lambda p, o: o.write(f"closed  {p.get('program_id')}\n"))
+
+    def _render(p, out):
+        if isinstance(p.get("closed"), list):
+            ids = ", ".join(p["closed"]) or "(none)"
+            out.write(f"closed  {p.get('count', len(p['closed']))} program(s): {ids}\n")
+        else:
+            out.write(f"closed  {p.get('program_id')}\n")
+
+    _emit(response["result"], ns, text_renderer=_render)
     return 0
 
 
@@ -941,12 +950,16 @@ def cmd_refresh(ns: argparse.Namespace) -> int:
 @command(
     "save", help="Persist the program (to its project file, or export .gzf to PATH)",
     target=True,
-    args=[arg("path", nargs="?", default=None,
-              help="Export a Ghidra Zip File (.gzf) to PATH instead of saving in-project")],
+    args=[
+        arg("path", nargs="?", default=None,
+            help="Export a Ghidra Zip File (.gzf) to PATH instead of saving in-project"),
+        arg("--path", dest="path_flag", default=None,
+            help="Output path (alias for the positional)"),
+    ],
 )
 def cmd_save(ns: argparse.Namespace) -> int:
     try:
-        response = _send("save_database", ns, path=ns.path)
+        response = _send("save_database", ns, path=ns.path_flag or ns.path)
     except BridgeError as exc:
         print(f"ghx save: {exc}", file=sys.stderr)
         return 1
@@ -1261,18 +1274,37 @@ def cmd_function_create(ns: argparse.Namespace) -> int:
 @command(
     "read", help="Read raw bytes from program memory at an address", target=True,
     args=[
-        arg("address", help="Address to read from (hex 0x.. or decimal)"),
+        arg("address", nargs="?", default=None,
+            help="Address to read from (hex 0x.. or decimal)"),
+        arg("--address", dest="address_flag", default=None,
+            help="Address to read from (alias for the positional)"),
         arg("-n", "--length", type=int, default=16,
             help="Number of bytes to read (default: 16, max: 65536)"),
+        arg("--encoding", choices=("hex", "bytes"), default="hex",
+            help="Byte payload: hex hexdump (default) or raw bytes (to --out or stdout)"),
     ],
 )
 def cmd_read(ns: argparse.Namespace) -> int:
+    address = ns.address_flag or ns.address
+    if address is None:
+        print("ghx read: provide an address (positional or --address)", file=sys.stderr)
+        return 2
     try:
-        response = _send("read_bytes", ns, address=ns.address, length=ns.length)
+        response = _send("read_bytes", ns, address=address, length=ns.length)
     except BridgeError as exc:
         print(f"ghx read: {exc}", file=sys.stderr)
         return 1
-    _emit(response["result"], ns, text_renderer=_render_read)
+    result = response["result"]
+    if ns.encoding == "bytes":
+        data = bytes.fromhex(result.get("bytes_hex", "") or "")
+        out_path = _resolve_out(ns)
+        if out_path:
+            Path(out_path).expanduser().write_bytes(data)
+            print(f"wrote {len(data)} bytes to {out_path}")
+        else:
+            sys.stdout.buffer.write(data)
+        return 0
+    _emit(result, ns, text_renderer=_render_read)
     return 0
 
 

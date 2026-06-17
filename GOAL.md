@@ -184,9 +184,12 @@ and mirrors `session`. ghx splits: `session {list,start,stop,restart}` +
 - [ ] `instance prune` — add `--dry-run`, `--include-gui`, `--include-sticky`.
 
 ### P2 — misc option parity
-- [ ] `close --all` (close every loaded program in one call).
-- [ ] `read --encoding {hex,bytes}` and `--address` alias.
-- [ ] `save --path` alias for the positional output path.
+- [x] `close --all` (closes every loaded program; returns `{closed:[...],count}`).
+  Verified on `fw-A/bin-1` (caught + fixed a duplicate-`close_all` shadowing bug
+  via dogfooding).
+- [x] `read --encoding {hex,bytes}` and `--address` alias. `--encoding bytes`
+  writes raw bytes to `--out` or stdout. Verified on `fw-A/bin-1`.
+- [x] `save --path` alias for the positional output path.
 - [ ] `comment` — reconcile ghx `--kind`/`--kinds` naming with bn (`comment list
   --query`).
 - [ ] `target info --verbose`.
@@ -247,6 +250,9 @@ already loaded speeds the loop. Keep all captured artifacts under `.dogfood/`.
 
 ## Progress ledger (append one line per cycle — newest first)
 
+- 2026-06-17 — P2 surface: `close --all`, `read --address`/`--encoding {hex,bytes}`,
+  `save --path` alias. Dogfooding caught a duplicate-`close_all` method shadowing
+  bug (returned None) — fixed. 172 green.
 - 2026-06-17 — `evidence xrefs --limit/--offset` (through `_op_xrefs` paging) and
   `evidence init --limit` (per-section entry cap with `truncated`). 168 green.
 - 2026-06-17 — Friction-log signal fixes: `taint forward` sources/sinks echo now

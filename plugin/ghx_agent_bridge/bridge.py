@@ -294,14 +294,19 @@ class TargetManager:
             handle.program.release(handle.consumer)
         return {"program_id": handle.program_id, "closed": True}
 
-    def close_all(self) -> None:
+    def close_all(self) -> dict[str, Any]:
+        """Release every loaded program. Used both by the `close --all` op and
+        by daemon shutdown (which ignores the return value)."""
         with self._lock:
             handles = list(self._handles.values())
             self._handles.clear()
             self._active = None
+        closed: list[str] = []
         for h in handles:
             with contextlib.suppress(Exception):
                 h.program.release(h.consumer)
+            closed.append(h.program_id)
+        return {"closed": closed, "count": len(closed)}
 
     # ---- resolution -----------------------------------------------------
 
@@ -559,6 +564,8 @@ class GhxBridge:
             handle = self.targets.load_binary(str(path), quick=quick)
             return {"loaded": True, "analyzed": not quick, **handle.describe()}
         if op == "close_binary":
+            if params.get("all"):
+                return self.targets.close_all()
             return self.targets.close(params.get("selector") or target)
         if op == "decompile":
             return self._op_decompile(params, target)
