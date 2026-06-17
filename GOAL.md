@@ -297,9 +297,11 @@ ghx is missing these in several places:
 - [x] `evidence xrefs`: added `--limit`/`--offset` (threads through `_op_xrefs`
   paging; keeps `incoming_total`). `evidence init`: added `--limit` (caps entries
   per section, keeps full `count`, flags `truncated`). Verified on `fw-A/bin-1`.
-- [ ] `types`: bn exposes group-level `--count/--limit/--offset/--query`; ghx
-  exposes these on the `types list` subcommand instead. Confirm the agent
-  workflow is equivalent or align the surface.
+- [x] `types`: ghx exposes `--limit/--offset/--query` on the `types list`
+  subcommand (vs bn's group-level placement) — an equivalent agent workflow.
+  Closed the one real gap: added `--count` to `ghx types list` (bn had it, ghx
+  didn't). Verified on `/bin/ls` (count 167 = full list; `--query int --count` =
+  9).
 
 ### P1 — IL / decompile / disasm slicing
 - [x] `il`: added `--lines START:END` slicing (keeps large IL inline instead of

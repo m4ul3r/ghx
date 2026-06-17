@@ -1501,6 +1501,8 @@ class GhxBridge:
                 }
             )
         rows.sort(key=lambda row: row["path"].lower())
+        if params.get("count"):
+            return {"count": len(rows)}
         if offset:
             rows = rows[offset:]
         if limit is not None:

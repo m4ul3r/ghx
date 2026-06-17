@@ -1618,20 +1618,31 @@ def cmd_sections(ns: argparse.Namespace) -> int:
 @command(
     "types", "list", help="List data types",
     target=True, paged=True,
-    args=[arg("--query", default=None)],
+    args=[
+        arg("--query", default=None),
+        arg("--count", action="store_true",
+            help="Show the matching type count instead of listing"),
+    ],
 )
 def cmd_types(ns: argparse.Namespace) -> int:
     try:
         response = _send(
             "types", ns,
             query=ns.query,
-            offset=ns.offset,
-            limit=ns.limit,
+            offset=None if ns.count else ns.offset,
+            limit=None if ns.count else ns.limit,
+            count=ns.count or None,
         )
     except BridgeError as exc:
         print(f"ghx types list: {exc}", file=sys.stderr)
         return 1
-    rows = response["result"] or []
+    result = response["result"]
+    if ns.count:
+        payload = result if isinstance(result, dict) else {"count": len(result or [])}
+        _emit(payload, ns,
+              text_renderer=lambda r, o: o.write(f"{r.get('count', 0)} types\n"))
+        return 0
+    rows = result or []
 
     def _render(rows, out):
         for r in rows:

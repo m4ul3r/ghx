@@ -87,6 +87,8 @@ def test_version_is_exposed(parser, capsys):
         ["sections", "--count"],
         ["sections", "--query", ".text", "--limit", "5"],
         ["types", "list"],
+        ["types", "list", "--query", "size", "--count"],
+        ["types", "list", "--limit", "20", "--offset", "5"],
         ["types", "show", "size_t"],
         ["types", "declare", "--source", "struct S { int x; };"],
         ["types", "declare", "--stdin"],
