@@ -155,7 +155,9 @@ ghx is missing these in several places:
 - [x] `function search`: added `--exact` (case-sensitive, mutex with `--regex`),
   `--min-address`/`--max-address`, and `--sort`. Render now shows size. Verified
   on `fw-A/bin-1`.
-- [ ] `evidence xrefs`: add `--limit`, `--offset`. `evidence init`: add `--limit`.
+- [x] `evidence xrefs`: added `--limit`/`--offset` (threads through `_op_xrefs`
+  paging; keeps `incoming_total`). `evidence init`: added `--limit` (caps entries
+  per section, keeps full `count`, flags `truncated`). Verified on `fw-A/bin-1`.
 - [ ] `types`: bn exposes group-level `--count/--limit/--offset/--query`; ghx
   exposes these on the `types list` subcommand instead. Confirm the agent
   workflow is equivalent or align the surface.
@@ -245,6 +247,8 @@ already loaded speeds the loop. Keep all captured artifacts under `.dogfood/`.
 
 ## Progress ledger (append one line per cycle — newest first)
 
+- 2026-06-17 — `evidence xrefs --limit/--offset` (through `_op_xrefs` paging) and
+  `evidence init --limit` (per-section entry cap with `truncated`). 168 green.
 - 2026-06-17 — Friction-log signal fixes: `taint forward` sources/sinks echo now
   compact strings (+counts) so default JSON is ~11 lines and `| tail`-safe;
   `dataflow values --no-frame` drops sp/fp/lr/pc noise; confirmed `taint forward

@@ -2274,6 +2274,7 @@ class GhxBridge:
         program = handle.program
         ptr_size = int(program.getDefaultPointerSize())
         wanted = {n.lower() for n in self._INIT_SECTION_NAMES}
+        limit = int(params["limit"]) if params.get("limit") is not None else None
 
         sections: list[dict[str, Any]] = []
         for block in program.getMemory().getBlocks():
@@ -2291,13 +2292,19 @@ class GhxBridge:
                     continue
                 entry = {"slot": f"0x{slot_off:x}", **_resolve_pointer_target(program, value)}
                 entries.append(entry)
+            full_count = len(entries)
+            truncated = limit is not None and full_count > limit
+            if truncated:
+                entries = entries[:limit]
             sections.append(
                 {
                     "name": name,
                     "start": f"0x{start:x}",
                     "size": size,
                     "pointer_size": ptr_size,
-                    "count": len(entries),
+                    "count": full_count,
+                    "shown": len(entries),
+                    "truncated": truncated,
                     "entries": entries,
                 }
             )

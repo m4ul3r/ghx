@@ -1961,12 +1961,13 @@ def cmd_trace(ns: argparse.Namespace) -> int:
 @command(
     "evidence", "xrefs",
     help="Xrefs with section/symbol/disassembly context",
-    fmt="json", target=True,
+    fmt="json", target=True, paged=True,
     args=[arg("identifier", help="Address, symbol, or function to cross-reference")],
 )
 def cmd_evidence_xrefs(ns: argparse.Namespace) -> int:
     try:
-        response = _send("evidence_xrefs", ns, identifier=ns.identifier)
+        response = _send("evidence_xrefs", ns, identifier=ns.identifier,
+                         offset=ns.offset, limit=ns.limit)
     except BridgeError as exc:
         print(f"ghx evidence xrefs: {exc}", file=sys.stderr)
         return 1
@@ -1978,7 +1979,9 @@ def cmd_evidence_xrefs(ns: argparse.Namespace) -> int:
         suffix += f"  {sym}" if sym else ""
         out.write(f"target  {r.get('target')}{suffix}\n")
         inc = r.get("incoming", [])
-        out.write(f"incoming  ({len(inc)})\n")
+        total = r.get("incoming_total")
+        shown = f"{len(inc)} of {total}" if total is not None and total != len(inc) else str(len(inc))
+        out.write(f"incoming  ({shown})\n")
         for ref in inc:
             fn = ref.get("function") or "-"
             sec = ref.get("section") or "-"
@@ -2051,10 +2054,14 @@ def cmd_evidence_function(ns: argparse.Namespace) -> int:
     "evidence", "init",
     help="Summarize ctor/dtor pointer sections (.init_array/.fini_array/.ctors)",
     fmt="json", target=True,
+    args=[
+        arg("--limit", type=int, default=None,
+            help="Cap the entries listed per section (full count still reported)"),
+    ],
 )
 def cmd_evidence_init(ns: argparse.Namespace) -> int:
     try:
-        response = _send("evidence_init", ns)
+        response = _send("evidence_init", ns, limit=ns.limit)
     except BridgeError as exc:
         print(f"ghx evidence init: {exc}", file=sys.stderr)
         return 1
@@ -2065,7 +2072,8 @@ def cmd_evidence_init(ns: argparse.Namespace) -> int:
             out.write("(no init/fini/ctor/dtor sections found)\n")
             return
         for s in secs:
-            out.write(f"{s['name']}  @ {s['start']}  ({s['count']} entries)\n")
+            extra = f", showing {s['shown']}" if s.get("truncated") else ""
+            out.write(f"{s['name']}  @ {s['start']}  ({s['count']} entries{extra})\n")
             for e in s.get("entries", []):
                 tgt = e.get("target") or f"<{e.get('kind')}>"
                 out.write(f"  {e['slot']:>12}  -> {e.get('value')}  {tgt}\n")
