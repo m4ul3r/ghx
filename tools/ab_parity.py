@@ -319,7 +319,7 @@ def main() -> int:
         if lr.returncode != 0:
             print(f"ghx load failed: {lr.stderr or lr.stdout}", file=sys.stderr)
             if started_bn:
-                subprocess.run(["bn", "instance", "stop", bn_inst],
+                subprocess.run(["bn", "session", "stop", bn_inst],
                                capture_output=True, text=True)
             return 1
 
@@ -328,7 +328,8 @@ def main() -> int:
     finally:
         if started_bn and not ns.keep:
             print(f"# stopping bn instance {bn_inst}", file=sys.stderr)
-            subprocess.run(["bn", "instance", "stop", bn_inst],
+            # `bn instance` has no `stop`; the lifecycle verb is `bn session stop`.
+            subprocess.run(["bn", "session", "stop", bn_inst],
                            capture_output=True, text=True)
 
 
