@@ -1427,14 +1427,50 @@ def cmd_strings(ns: argparse.Namespace) -> int:
     return 0
 
 
-@command("imports", help="List imported symbols + thunks", target=True)
+@command(
+    "imports", help="List imported symbols + thunks", target=True, paged=True,
+    args=[
+        arg("--summary", action="store_true",
+            help="Show aggregate counts by library and kind instead of the list"),
+        arg("--count", action="store_true",
+            help="Show the total import count instead of listing"),
+    ],
+)
 def cmd_imports(ns: argparse.Namespace) -> int:
     try:
-        response = _send("imports", ns)
+        response = _send(
+            "imports", ns,
+            summary=ns.summary or None,
+            count=ns.count or None,
+            offset=ns.offset,
+            limit=ns.limit,
+        )
     except BridgeError as exc:
         print(f"ghx imports: {exc}", file=sys.stderr)
         return 1
-    rows = response["result"] or []
+    result = response["result"]
+
+    if ns.summary:
+        def _render_summary(s, out):
+            out.write(f"total     {s.get('total', 0)}\n")
+            kind = s.get("by_kind", {})
+            out.write(
+                f"kinds     external={kind.get('external', 0)}  "
+                f"thunk={kind.get('thunk', 0)}\n"
+            )
+            out.write("by library\n")
+            for lib, n in (s.get("by_library") or {}).items():
+                out.write(f"  {n:>5}  {lib}\n")
+
+        _emit(result, ns, text_renderer=_render_summary)
+        return 0
+
+    if ns.count:
+        payload = result if isinstance(result, dict) else {"count": len(result or [])}
+        _emit(payload, ns, text_renderer=lambda r, out: out.write(f"{r.get('count', 0)} imports\n"))
+        return 0
+
+    rows = result or []
 
     def _render(rows, out):
         for r in rows:
@@ -1447,15 +1483,27 @@ def cmd_imports(ns: argparse.Namespace) -> int:
 
 
 @command(
-    "sections", help="List memory blocks", target=True,
-    args=[arg("--query", default=None)],
+    "sections", help="List memory blocks", target=True, paged=True,
+    args=[
+        arg("--query", default=None),
+        arg("--count", action="store_true",
+            help="Show the section count instead of listing"),
+    ],
 )
 def cmd_sections(ns: argparse.Namespace) -> int:
     try:
-        response = _send("sections", ns, query=ns.query)
+        response = _send(
+            "sections", ns, query=ns.query,
+            count=ns.count or None, offset=ns.offset, limit=ns.limit,
+        )
     except BridgeError as exc:
         print(f"ghx sections: {exc}", file=sys.stderr)
         return 1
+    if ns.count:
+        result = response["result"]
+        payload = result if isinstance(result, dict) else {"count": len(result or [])}
+        _emit(payload, ns, text_renderer=lambda r, out: out.write(f"{r.get('count', 0)} sections\n"))
+        return 0
     rows = response["result"] or []
 
     def _render(rows, out):

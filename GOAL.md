@@ -136,10 +136,12 @@ ghx is missing these in several places:
   `incoming_total` (and `code_refs_total` for `--field`) so paging is visible
   ("N of M" in text). Refs are address-sorted for stable pages. Verified on
   `fw-A/bin-1`.
-- [ ] `imports`: add `--count`, `--limit`, `--offset`, `--summary` (aggregate by
-  namespace/kind). Also collapse the 3-lines-per-symbol verbosity (external + 2
-  thunks) for quick scans.
-- [ ] `sections`: add `--count`, `--limit`, `--offset`.
+- [x] `imports`: added `--count`, `--limit`, `--offset`, `--summary`. `--summary`
+  aggregates `by_kind` (external/thunk) + `by_library`, which directly answers
+  the friction-log "3 rows per symbol" verbosity (28 external / 56 thunks on
+  `fw-A/bin-1`). Verified.
+- [x] `sections`: added `--count`, `--limit`, `--offset` (address-sorted pages).
+  Verified on `fw-A/bin-1`.
 - [ ] `function list`: add `--count`, `--sort`.
 - [ ] `function search`: add `--exact`, `--min-address`, `--max-address`, `--sort`.
 - [ ] `evidence xrefs`: add `--limit`, `--offset`. `evidence init`: add `--limit`.
@@ -230,6 +232,9 @@ already loaded speeds the loop. Keep all captured artifacts under `.dogfood/`.
 
 ## Progress ledger (append one line per cycle — newest first)
 
+- 2026-06-17 — More P1 listing ergonomics: `imports --count/--limit/--offset/
+  --summary` and `sections --count/--limit/--offset`. Full suite 157 green.
+  Dogfooded on `fw-A/bin-1` (summary: 28 external / 56 thunks).
 - 2026-06-17 — Shipped P1 listing ergonomics: `strings --regex/--count` (match on
   decoded content) and `xrefs --limit/--offset` (with totals). Bridge + CLI +
   parser tests; full unit suite 152 green. Dogfooded both on `fw-A/bin-1`.

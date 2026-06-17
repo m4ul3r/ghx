@@ -1201,7 +1201,7 @@ class GhxBridge:
             rows = rows[:limit]
         return rows
 
-    def _op_imports(self, params: dict[str, Any], target: str | None) -> list[dict[str, Any]]:
+    def _op_imports(self, params: dict[str, Any], target: str | None):
         handle = self.targets.resolve(params.get("target") or target, required=True)
         assert handle is not None
         program = handle.program
@@ -1244,9 +1244,35 @@ class GhxBridge:
                 }
             )
         rows.sort(key=lambda row: (row["name"], int(row["address"], 16)))
+
+        if params.get("summary"):
+            by_library: dict[str, int] = {}
+            thunk = external = 0
+            for r in rows:
+                lib = r.get("library") or "(none)"
+                by_library[lib] = by_library.get(lib, 0) + 1
+                if r["is_thunk"]:
+                    thunk += 1
+                else:
+                    external += 1
+            return {
+                "total": len(rows),
+                "by_kind": {"external": external, "thunk": thunk},
+                "by_library": dict(
+                    sorted(by_library.items(), key=lambda kv: (-kv[1], kv[0]))
+                ),
+            }
+        if params.get("count"):
+            return {"count": len(rows)}
+        offset = int(params.get("offset", 0))
+        limit = int(params["limit"]) if params.get("limit") is not None else None
+        if offset:
+            rows = rows[offset:]
+        if limit is not None:
+            rows = rows[:limit]
         return rows
 
-    def _op_sections(self, params: dict[str, Any], target: str | None) -> list[dict[str, Any]]:
+    def _op_sections(self, params: dict[str, Any], target: str | None):
         handle = self.targets.resolve(params.get("target") or target, required=True)
         assert handle is not None
         query = params.get("query")
@@ -1274,6 +1300,15 @@ class GhxBridge:
                     "source": str(block.getSourceName()) if block.getSourceName() else None,
                 }
             )
+        rows.sort(key=lambda row: int(row["start"], 16))
+        if params.get("count"):
+            return {"count": len(rows)}
+        offset = int(params.get("offset", 0))
+        limit = int(params["limit"]) if params.get("limit") is not None else None
+        if offset:
+            rows = rows[offset:]
+        if limit is not None:
+            rows = rows[:limit]
         return rows
 
     def _op_types(self, params: dict[str, Any], target: str | None) -> list[dict[str, Any]]:
