@@ -172,6 +172,70 @@ def test_structured_il_read_create(running_agent):
     assert "already_exists" in str(exc.value)
 
 
+def test_il_named_vs_raw(running_agent):
+    """`il` defaults to named, formatted p-code with INDIRECT folded away and a
+    structured ops[] alongside; --raw restores Ghidra's bare tuple dump."""
+    load = send_request(
+        "load_binary",
+        params={"path": "/bin/true"},
+        instance_id=running_agent,
+        timeout=120.0,
+    )
+    assert load["ok"] is True
+    program_id = load["result"]["program_id"]
+
+    # Default high form: formatted text + structured ops, no raw tuples.
+    named = send_request(
+        "il",
+        params={"identifier": "entry", "form": "high"},
+        target=program_id,
+        instance_id=running_agent,
+        timeout=60.0,
+    )
+    assert named["ok"] is True
+    res = named["result"]
+    assert res["form"] == "high" and res["raw"] is False
+    assert res["op_count"] > 0
+    assert isinstance(res["ops"], list) and res["ops"]
+    assert res["text"]
+    # Formatted view never emits the bare "(register, 0x..," tuple form.
+    assert "(register," not in res["text"]
+    # At least one register varnode resolved to a name in the structured ops.
+    reg_names = [
+        vn.get("register")
+        for op in res["ops"]
+        for vn in [op.get("output"), *op.get("inputs", [])]
+        if vn and vn.get("kind") == "register"
+    ]
+    assert any(reg_names), "expected at least one named register varnode"
+
+    # --raw: legacy unformatted PcodeOp.toString dump.
+    raw = send_request(
+        "il",
+        params={"identifier": "entry", "form": "high", "raw": True},
+        target=program_id,
+        instance_id=running_agent,
+        timeout=60.0,
+    )
+    assert raw["ok"] is True
+    assert raw["result"]["raw"] is True
+    raw_text = raw["result"]["text"]
+    assert any(m in raw_text for m in ("(register,", "(const,", "(unique,"))
+    assert raw_text != res["text"]
+
+    # --indirect never drops lines relative to the default (hidden ops return).
+    shown = send_request(
+        "il",
+        params={"identifier": "entry", "form": "high", "indirect": True},
+        target=program_id,
+        instance_id=running_agent,
+        timeout=60.0,
+    )
+    assert shown["ok"] is True
+    assert shown["result"]["hidden_indirect"] == 0
+    assert len(shown["result"]["text"].splitlines()) >= len(res["text"].splitlines())
+
+
 def test_evidence_ops(running_agent):
     """Tier B composition ops: evidence_function, evidence_xrefs."""
     load = send_request(
