@@ -169,7 +169,7 @@ class ProgramHandle:
     program: Any = field(repr=False)
     consumer: Any = field(repr=False)
 
-    def describe(self) -> dict[str, Any]:
+    def describe(self, verbose: bool = False) -> dict[str, Any]:
         prog = self.program
         try:
             language = str(prog.getLanguage().getLanguageID())
@@ -183,7 +183,7 @@ class ProgramHandle:
         except Exception:
             size = 0
         entry_off = _program_entry_offset(prog)
-        return {
+        info: dict[str, Any] = {
             "program_id": self.program_id,
             "basename": self.basename,
             "filename": self.filename,
@@ -196,6 +196,28 @@ class ProgramHandle:
             "size": size,
             "entry": f"0x{entry_off:x}" if entry_off is not None else None,
         }
+        if verbose:
+            # bn's `target info --verbose` adds the segment map (r/w/x ranges).
+            segments: list[dict[str, Any]] = []
+            try:
+                for b in prog.getMemory().getBlocks():
+                    perms = (
+                        ("r" if b.isRead() else "-")
+                        + ("w" if b.isWrite() else "-")
+                        + ("x" if b.isExecute() else "-")
+                    )
+                    segments.append({
+                        "name": str(b.getName()),
+                        "start": f"0x{int(b.getStart().getOffset()):x}",
+                        "end": f"0x{int(b.getEnd().getOffset()):x}",
+                        "size": int(b.getSize()),
+                        "perms": perms,
+                        "initialized": bool(b.isInitialized()),
+                    })
+            except Exception:
+                pass
+            info["segments"] = segments
+        return info
 
 
 class TargetManager:
@@ -555,7 +577,7 @@ class GhxBridge:
         if op == "target_info":
             handle = self.targets.resolve(params.get("selector") or target, required=True)
             assert handle is not None
-            return handle.describe()
+            return handle.describe(verbose=bool(params.get("verbose")))
         if op == "load_binary":
             path = params.get("path")
             if not path:
@@ -1790,6 +1812,8 @@ class GhxBridge:
             want = [str(k).lower() for k in kinds]
         else:
             want = ["plate", "pre", "post", "eol", "repeatable"]
+        query = params.get("query")
+        needle = str(query).lower() if query else None
 
         rows: list[dict[str, Any]] = []
         type_map = {
@@ -1808,6 +1832,8 @@ class GhxBridge:
                 addr = it.next()
                 text = listing.getComment(ctype, addr)
                 if text is None:
+                    continue
+                if needle is not None and needle not in str(text).lower():
                     continue
                 rows.append(
                     {

@@ -979,10 +979,13 @@ def cmd_save(ns: argparse.Namespace) -> int:
     return 0
 
 
-@command("target", "info", help="Describe a loaded program", target=True)
+@command("target", "info", help="Describe a loaded program", target=True,
+         args=[arg("-v", "--verbose", action="store_true",
+                   help="Include the segment map (r/w/x address ranges)")])
 def cmd_target_info(ns: argparse.Namespace) -> int:
     try:
-        response = _send("target_info", ns, selector=ns.target)
+        response = _send("target_info", ns, selector=ns.target,
+                         verbose=ns.verbose or None)
     except BridgeError as exc:
         print(f"ghx target info: {exc}", file=sys.stderr)
         return 1
@@ -2429,13 +2432,17 @@ def cmd_comment_delete(ns: argparse.Namespace) -> int:
 @command(
     "comment", "list", help="List comments",
     target=True, paged=True,
-    args=[arg("--kinds", default=None,
-              help="Comma-separated kinds to include (default: all)")],
+    args=[
+        arg("--kinds", default=None,
+            help="Comma-separated kinds to include (default: all)"),
+        arg("--query", default=None,
+            help="Filter comments by substring (case-insensitive), like bn"),
+    ],
 )
 def cmd_comment_list(ns: argparse.Namespace) -> int:
     kinds = ns.kinds.split(",") if ns.kinds else None
     try:
-        response = _send("list_comments", ns, kinds=kinds)
+        response = _send("list_comments", ns, kinds=kinds, query=ns.query)
     except BridgeError as exc:
         print(f"ghx comment list: {exc}", file=sys.stderr)
         return 1

@@ -340,9 +340,12 @@ ghx extra).
 - [x] `read --encoding {hex,bytes}` and `--address` alias. `--encoding bytes`
   writes raw bytes to `--out` or stdout. Verified on `fw-A/bin-1`.
 - [x] `save --path` alias for the positional output path.
-- [ ] `comment` — reconcile ghx `--kind`/`--kinds` naming with bn (`comment list
-  --query`).
-- [ ] `target info --verbose`.
+- [x] `comment list` — added bn's `--query` (case-insensitive substring filter on
+  comment text). ghx keeps `--kinds` (filter by comment kind, a ghx extra bn
+  lacks); the two compose. Verified on `/bin/ls`.
+- [x] `target info --verbose` (`-v`) — adds the segment map (name/start/end/size/
+  r-w-x perms/initialized), matching bn's `--verbose`. Verified on `/bin/ls`
+  (33 segments).
 - [ ] `evidence {function,table,message}` — reconcile remaining flag diffs
   (`--context`, `--entries`/`--stride`, `--table-entries`). Audit each against bn.
 - [x] `strings` value field now matches bn: `value` is the raw decoded string
