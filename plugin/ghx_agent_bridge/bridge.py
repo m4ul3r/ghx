@@ -1293,11 +1293,22 @@ class GhxBridge:
                 continue
             if section_needle and section != section_needle:
                 continue
+            # bn returns the raw decoded string; Ghidra's
+            # getDefaultValueRepresentation() decorates it (`u8"libc.so.6"`).
+            # Expose the decoded content as `value` (parity), carry the original
+            # representation as `repr`, and split out the encoding prefix.
+            encoding = None
+            for pfx in ("u8", "U", "L", "u"):
+                if value.startswith(pfx + '"'):
+                    encoding = pfx
+                    break
             rows.append(
                 {
                     "address": f"0x{off:x}",
                     "length": length,
-                    "value": value,
+                    "value": content,
+                    "repr": value,
+                    "encoding": encoding,
                     "section": section,
                 }
             )

@@ -321,10 +321,10 @@ and mirrors `session`. ghx splits: `session {list,start,stop,restart}` +
 - [ ] `target info --verbose`.
 - [ ] `evidence {function,table,message}` — reconcile remaining flag diffs
   (`--context`, `--entries`/`--stride`, `--table-entries`). Audit each against bn.
-- [ ] `strings` value field is Ghidra's C-literal repr (`u8"libc.so.6"`,
-  trailing quote). bn returns the raw decoded string. Consider exposing the
-  decoded `value` and carrying the encoding/prefix separately, so output matches
-  bn. (Discovered 2026-06-17; matching already uses the decoded content.)
+- [x] `strings` value field now matches bn: `value` is the raw decoded string
+  (`libc.so.6`), with Ghidra's C-literal kept as `repr` (`u8"libc.so.6"`) and the
+  prefix split into `encoding`. Verified on `fw-A/bin-1` (`value='libc.so.6'
+  repr='u8"libc.so.6"' encoding='u8'`).
 
 ### Out of scope (do NOT implement without a new decision)
 - `plugin` — Binary Ninja's GUI companion-plugin installer. ghx's phase-2 GUI
