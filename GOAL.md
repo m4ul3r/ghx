@@ -98,20 +98,39 @@ matches bn. Re-grade against this A/B bar.
 Build the A/B harness and drive each command's answer to agree with bn, or
 document why it can't (genuine engine difference). Until this is done, parity is
 unproven regardless of how many flags match.
-- [ ] **A/B harness.** Script: spin an isolated bn instance (`--instance
-  <uniq>`, NEVER touch the sensitive ones — `bn instance list` shows ~20 real
-  targets) + a ghx daemon on the same binary; run each command both ways; diff
-  shapes/counts/answers; emit a divergence report. Stop only the instance you
-  started (`bn instance stop <id>`).
-- [ ] **Reconcile counting divergences.** imports (dedupe thunks vs externals?),
-  functions (exclude thunks/stubs to match bn's notion?), strings (min-len /
-  defined-string heuristic), sections. Decide per-command: match bn, or document
-  the engine difference in `note`/help. A 51-vs-79 function count is a real
-  agent-facing discrepancy.
-- [ ] **Decompiler/type divergence.** Naming (`sub_` vs `FUN_`), inferred return
-  types, line counts differ. Likely "document, don't force" — but verify the
-  *information* is equivalent (same logic recovered), not byte-identical text.
-- [ ] **Run it on a corpus, not one 13KB binary.** Multiple arches/sizes.
+- [x] **A/B harness** — `tools/ab_parity.py <binary>`. Starts an isolated bn
+  instance (never touches the ~20 sensitive ones), loads the same binary in both,
+  and diffs address/name sets per command (addresses are ground truth). First run
+  on `fw-A/bin-1` root-caused every divergence below.
+
+Root-caused divergences (from the 2026-06-17 A/B run — each is now a concrete fix
+or a documented engine difference):
+- [ ] **functions (bn 51 / ghx 79).** TWO opposing effects: (a) ghx OVER-counts —
+  ~28 of the extras are synthetic thunks in Ghidra's `EXTERNAL` block at 0x414xxx
+  (`is_thunk=true`, size 1) plus a couple tiny `FUN_` stubs; bn doesn't call these
+  functions. (b) ghx UNDER-detects — bn found a real function at 0x401d40 that
+  Ghidra's auto-analysis missed entirely (`function info 0x401d40` → not_found).
+  Fix: give `function list` a way to exclude EXTERNAL-block thunks (match bn's
+  notion), and investigate the missed-function gap (analysis options / `function
+  create`).
+- [ ] **imports (bn 30 / ghx 28 by name).** ghx enumerates external *function*
+  symbols + thunks only; it MISSES imported DATA symbols (`stderr`,
+  `__stack_chk_guard`). Fix: include imported data/object symbols in `imports`.
+  (The raw 84-vs-59 count gap is just thunk-row inflation on both sides; compare
+  by unique name.)
+- [ ] **strings (bn 104 / ghx 125).** ghx includes ELF METADATA-section strings as
+  noise (the near-0x0 addresses are in `.shstrtab` / `.gnu_debuglink`); bn scans
+  only loaded segments. Conversely bn found 6 real strings in `0x40xxxx` that
+  Ghidra didn't define. Fix: default `strings` to loaded/initialized memory
+  (exclude `.shstrtab`/debug/section-header blocks); note the heuristic gap.
+- [ ] **sections (bn 25 / ghx 28).** Mostly synthetic-section modeling differences
+  (ghx exposes `EXTERNAL`, `_elfSectionHeaders`, `.shstrtab`; bn exposes
+  `.extern`, `.synthetic_builtins`, `.dynamic_rela`). Likely DOCUMENT, but
+  consider hiding pure ELF-metadata blocks from the default `sections` view.
+- [ ] **decompiler/types.** Naming (`sub_` vs `FUN_`), inferred return types
+  (`uint64_t` vs `void`), line counts (216 vs 139) differ — engine difference.
+  Verify the same *logic* is recovered, document rather than force byte-equality.
+- [ ] **Run on a corpus, not one 13KB binary.** Multiple arches/sizes.
 
 ## Backlog (prioritized, grounded in the dogfood friction log + option diff)
 
@@ -309,6 +328,12 @@ already loaded speeds the loop. Keep all captured artifacts under `.dogfood/`.
 
 ## Progress ledger (append one line per cycle — newest first)
 
+- 2026-06-17 — Built `tools/ab_parity.py` and root-caused all 4 structural
+  divergences via address-set diffs: functions = ghx over-counts EXTERNAL thunks
+  + misses 0x401d40 that bn found; imports = ghx misses data symbols (stderr,
+  __stack_chk_guard); strings = ghx includes .shstrtab/.gnu_debuglink metadata
+  noise; sections = synthetic-block modeling diff. Each now a concrete fix in
+  P0(real). This is what "understand the differences" produced.
 - 2026-06-17 — **Reality check (skeptic prompt).** Ran the first true A/B: same
   binary in an isolated bn instance vs ghx. Counts DIVERGE (funcs 51/79, imports
   59/84, strings 104/125, sections 25/28; decompile 216/139 lines, differing
