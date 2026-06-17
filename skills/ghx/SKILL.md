@@ -1,6 +1,6 @@
 ---
 name: ghx
-description: Use the local ghx CLI for Ghidra reversing work through the ghx PyGhidra daemon. Headless by default (no GUI required). Prefer this skill for decompilation, function search, callsite recovery, raw/high p-code, disassembly, xrefs, type inspection, struct field edits, preview/commit mutations, types declare, batch apply, and inline Python execution against a live Ghidra Program.
+description: Use the local ghx CLI for Ghidra reversing work through the ghx PyGhidra daemon. Headless by default (no GUI required). Prefer this skill for decompilation, function search, callsite recovery, raw/high p-code, disassembly, structured IL, xrefs, type inspection, struct field edits, preview/commit mutations, types declare, batch apply, inline Python; source→sink taint tracing (forward + backward slice), SSA def/use and constant (value) dataflow, resolved call graphs, evidence helpers (vtable/pointer-table tables, .init_array/.ctors, RTTI/type-name strings), raw memory reads, stable local-variable ids, sticky instance/target pins, and .gzf export against a live Ghidra Program.
 ---
 
 # ghx
@@ -96,7 +96,13 @@ ghx decompile sample_parse --addresses     # prefix each line with its min addre
 ghx decompile sample_parse --lines 20:60   # slice output to lines 20..60
 ghx il sample_parse --form raw             # per-instruction p-code
 ghx il sample_parse --form high            # decompiler high p-code (SSA-ish)
+ghx function structured-il sample_parse    # per-pcode-op JSON (op/inputs/output) for tooling
 ghx disasm sample_parse
+
+ghx read 0x401000 -n 64                    # hexdump raw bytes (accepts a symbol name too)
+ghx read sample_parse -n 16
+ghx function create 0x401abc               # define a function auto-analysis missed
+ghx function create 0x401abc --name parse_hdr --preview
 
 ghx xrefs sample_parse
 ghx xrefs 0x401000
@@ -157,21 +163,101 @@ next instructions around each site.
 
 ## Field Xrefs
 
-`ghx field-xrefs` walks each function's high p-code and matches PTRSUB /
+`ghx xrefs --field` walks each function's high p-code and matches PTRSUB /
 PTRADD ops whose constant offset is the target field and whose base pointer
-is typed as the target struct (or pointer to it).
+is typed as the target struct (or pointer to it). (The op is `field_xrefs`;
+there is **no** top-level `field-xrefs` command — it's a flag on `xrefs`.)
 
 ```bash
 # Fast path: limit to one function.
-ghx field-xrefs --type-name Player --field hp --in-function player_update
+ghx xrefs --field Player.hp --in-function player_update
+
+# By offset instead of field name.
+ghx xrefs --field Player.0x10 --in-function player_update
 
 # Whole-binary: slow; ~3s per 100 functions depending on timeout.
-ghx field-xrefs --type-name Player --offset 0x10 --timeout 15
+ghx xrefs --field Player.hp --timeout 15
 ```
 
 Requires that the relevant locals/parameters are *typed* as `Player *` in
-Ghidra. If the decompiler is using `undefined8` for the pointer, `field-xrefs`
+Ghidra. If the decompiler is using `undefined8` for the pointer, field scans
 will miss those sites. Use `ghx local retype` to fix typing first.
+
+## Evidence Helpers
+
+One-shot triage summaries that aggregate several primitives. All default to
+JSON; large ones spill — use `--out` or `--format text`.
+
+```bash
+ghx evidence function parse_hdr        # prototype, section, thunk info,
+                                       # outgoing calls (resolved), insn count,
+                                       # incoming-xref count, arg hints
+ghx evidence xrefs parse_hdr           # xrefs enriched with section + symbol +
+                                       # disasm context per ref
+ghx evidence init                      # walk .init_array/.fini_array/.ctors/.dtors
+                                       # as pointer arrays -> resolved functions
+ghx evidence table 0x4a1000 -n 32      # interpret memory as a pointer table /
+                                       # vtable; classifies each slot
+                                       # (function/symbol/data/unmapped),
+                                       # flags looks_like_vtable
+ghx evidence table 0x4a1000 --no-stop  # don't stop at the first unmapped slot
+ghx evidence message --query 'google::protobuf'   # type-name/RTTI/message
+ghx evidence message --query '^_ZTV' --regex      # strings + their xrefs + section
+ghx evidence message                   # no query -> type-name heuristic ("::" / dotted)
+```
+
+`evidence table` and `evidence init` are the fast path for C++ vtable / RTTI
+recovery and constructor discovery; `evidence message` finds the type-name
+strings those tables point near.
+
+## Dataflow & Taint
+
+The VR workhorses. All run on the decompiler's HighFunction (SSA) except
+`dataflow values`, which uses Ghidra's SymbolicPropogator.
+
+```bash
+# Where does a value come from / go?
+ghx dataflow defuse parse_hdr len            # SSA def site + all use sites of a variable
+                                             # (var = name OR stable id from `local list`)
+
+# Resolved call graph (direct edges; indirect targets are counted, not resolved)
+ghx dataflow callgraph parse_hdr                       # immediate callees + callers
+ghx dataflow callgraph parse_hdr --direction callees --depth 3
+ghx dataflow callgraph parse_hdr --direction callers   # who reaches this function
+
+# Proven constant register values at an address (NOT a full value-set — constants only)
+ghx dataflow values parse_hdr 0x401abc                 # all base registers
+ghx dataflow values parse_hdr 0x401abc --register X0
+
+# Backward taint: slice a sink argument (or variable) to its origins
+ghx taint backward parse_hdr --at 0x401abc --arg 0     # 0-based arg of the call at --at
+ghx taint backward parse_hdr --variable len            # slice a named variable
+ghx trace parse_hdr --at 0x401abc --arg 1              # alias: backward slice of a call arg
+
+# Forward taint: source -> sink chains (intraprocedural v1)
+ghx taint forward                                      # libc defaults, whole binary
+ghx taint forward --function handle_request            # scope to one function (fast)
+ghx taint forward --sources recv,read --sinks strcpy,system,memcpy
+```
+
+What each origin/leaf means in `taint backward` / `trace`:
+- `parameter` / `global` — the slice bottomed out at a function input
+- `const` — a literal value
+- `load` — a memory read (the pointer expression is sliced further)
+- `call_result` — the value is a callee's return (the slice stops here; this is
+  what `taint forward` keys on to declare a source→sink chain)
+
+**Honest scope (read before trusting):**
+- `taint forward` is **intraprocedural** in v1 — it finds a chain when a sink
+  argument backward-slices to a *source call's return* within the same function.
+  It does **not** follow taint across function boundaries (callee params/returns)
+  or through a source's out-buffer (`recv(fd, buf, ...)` does not yet taint
+  `*buf`). A reported chain is real; a missing one is possible — so 0 chains is
+  **not** an all-clear.
+- `dataflow values` reports **proven single constants**, not value-sets/ranges
+  (Ghidra has no native VSA). That is also why `dataflow callgraph` cannot
+  resolve indirect (computed) call targets and instead reports
+  `indirect_callsites` as a count.
 
 ## Bundles
 
@@ -413,30 +499,58 @@ expected, not a failure.
 present) and runs auto-analysis. It is idempotent — loading the same
 `basename` a second time returns the existing handle.
 
-Each mutation is saved to the project's `DomainFile` as it happens (Ghidra's
-DB model is transactional, not document-based like `.bndb`). If the daemon
-is killed, saved mutations survive in the Project directory. An ephemeral
-project (`~/.cache/ghx/projects/<instance>/`) is deleted on
-`session stop`; a persistent `--project` survives.
+```bash
+ghx load /path/to/binary           # import + full auto-analysis
+ghx load /path/to/binary --quick   # import only, SKIP auto-analysis (fast cold load)
+ghx refresh                        # run/redo full auto-analysis (use after --quick,
+                                   # or after a big type change)
+```
 
-There is no `ghx save` — commit-time persistence is automatic. If you need
-to re-run analysis (e.g. after a big type change), use:
+Use `--quick` to get a binary open in ~seconds for a first look (sections,
+strings, imports), then `ghx refresh` to deepen when you need functions/xrefs.
+The load result reports `analyzed: false` after a `--quick` load.
+
+Each mutation is saved to the project's `DomainFile` as it happens (Ghidra's
+DB model is transactional, not document-based). Commit-time persistence is
+automatic — you don't need to "save" to keep renames/types/comments. If the
+daemon is killed, saved mutations survive in a persistent `--project`; an
+ephemeral project (`~/.cache/ghx/projects/<instance>/`) is deleted on
+`session stop`.
+
+To export the analyzed program to a portable archive, use `ghx save <path>` —
+it writes a Ghidra Zip File (`.gzf`, extension appended if absent):
 
 ```bash
-ghx refresh
+ghx save /tmp/target.gzf           # export the current program as .gzf
+ghx save                           # no path: just flush to the project DomainFile
 ```
 
 ## Session Management
 
 `ghx` may run multiple daemons. If more than one is registered, commands
-that omit `--instance` fail with an ambiguity error. Pick one:
+that omit `--instance` fail with an ambiguity error. Pick one, or **pin** a
+default so you stop passing `--instance`/`-t` on every call:
 
 ```bash
 ghx session list               # list running daemons
-ghx --instance <id> doctor     # scope a command to one daemon
-ghx session stop               # stop the (only) running daemon
+ghx --instance <id> doctor     # scope one command to one daemon
 GHX_INSTANCE=<id> ghx doctor   # env-var scope
+ghx session stop               # stop the (only) running daemon
+
+# Sticky pins (survive across invocations; explicit --instance/-t still win):
+ghx instance use <id>          # default daemon for subsequent calls
+ghx instance clear
+ghx target use <selector>      # default program (program_id/basename/'active')
+ghx target clear
+
+# Lifecycle:
+ghx session restart            # stop + respawn same id, reloading its targets
+ghx instance prune --idle 900  # stop daemons idle longer than 900s
 ```
+
+A pin only takes effect when it points at a *live* instance; a stale pin is
+ignored. When juggling several binaries, `ghx target use <basename>` once is
+much less error-prone than threading `-t` through every command.
 
 ## Troubleshooting
 
@@ -459,7 +573,7 @@ Common failure modes:
 - **"no_target"**: no Program is loaded. Run `ghx load <path>` first.
 - **"apply_failed: TypeError: No matching overloads..."**: a Ghidra Java
   method was called with wrong types via `py exec`. Check the stub types at
-  `/opt/ghidra_12.0.4_PUBLIC/docs/ghidra_stubs/typestubs/ghidra-stubs/`.
+  `/opt/ghidra_12.1.2_PUBLIC/docs/ghidra_stubs/typestubs/ghidra-stubs/`.
 
 ## Known quirks
 
@@ -475,6 +589,15 @@ Common failure modes:
   locals (exist only in the HighFunction). `ghx local rename` handles both
   via `HighFunctionDBUtil.updateDBVariable`, but the HighFunction reference
   must be fresh — don't cache it across mutations.
+- **Stable local ids.** `ghx local list` emits an `id` per variable derived
+  from its storage (e.g. `X0`, `Stack[-0x10]`) that is stable across both
+  rename and retype. `ghx local rename`/`local retype` accept the variable
+  argument as **either a name or that id** — prefer the id in scripts so a
+  rename earlier in a batch doesn't break a later retype that referenced the
+  old name. (Names also still work.)
+- **`ghx rename` is an alias** for `ghx symbol rename` (rename a function or
+  data symbol by name or address). `ghx trace` is an alias for the call-arg
+  case of `ghx taint backward`.
 - **`field-xrefs` misses untyped accesses.** If a pointer is still
   `undefined8` instead of `Player *`, field scans won't find accesses
   through it. Retype first, rescan second. This includes global

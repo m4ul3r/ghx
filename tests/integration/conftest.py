@@ -16,7 +16,7 @@ def _resolve_ghidra_dir() -> Path | None:
     env = os.environ.get("GHIDRA_INSTALL_DIR")
     if env and (Path(env) / "Ghidra").is_dir():
         return Path(env)
-    default = Path("/opt/ghidra_12.0.4_PUBLIC")
+    default = Path("/opt/ghidra_12.1.2_PUBLIC")
     if (default / "Ghidra").is_dir():
         return default
     return None

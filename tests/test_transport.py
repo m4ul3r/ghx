@@ -11,7 +11,20 @@ from pathlib import Path
 
 import pytest
 
-from ghx import paths, transport
+from ghx import paths, pins, transport
+
+
+def _fake_instance(instance_id: str) -> transport.BridgeInstance:
+    return transport.BridgeInstance(
+        pid=1,
+        socket_path=Path(f"/tmp/{instance_id}.sock"),
+        registry_path=Path(f"/tmp/{instance_id}.json"),
+        plugin_name="ghx_agent_bridge",
+        plugin_version="test",
+        started_at=None,
+        meta={},
+        instance_id=instance_id,
+    )
 
 
 class _Handler(socketserver.StreamRequestHandler):
@@ -105,6 +118,31 @@ def test_send_request_bridges_error_into_exception(running_bridge):
 def test_choose_instance_raises_when_missing(tmp_cache):
     with pytest.raises(transport.BridgeError):
         transport.choose_instance("does-not-exist", auto_start=False)
+
+
+def test_choose_instance_honours_pin(tmp_cache, monkeypatch):
+    insts = [_fake_instance("aaaa"), _fake_instance("bbbb")]
+    monkeypatch.setattr(transport, "list_instances", lambda: insts)
+
+    # With two live instances and no pin, selection is ambiguous -> error.
+    with pytest.raises(transport.BridgeError):
+        transport.choose_instance(None, auto_start=False)
+
+    # A pin disambiguates.
+    pins.set_instance("bbbb")
+    assert transport.choose_instance(None, auto_start=False).instance_id == "bbbb"
+
+    # An explicit id still overrides the pin.
+    assert transport.choose_instance("aaaa", auto_start=False).instance_id == "aaaa"
+
+
+def test_choose_instance_ignores_stale_pin(tmp_cache, monkeypatch):
+    insts = [_fake_instance("aaaa")]
+    monkeypatch.setattr(transport, "list_instances", lambda: insts)
+    pins.set_instance("ghost")  # not among live instances
+
+    # Stale pin is ignored; the single live instance is returned.
+    assert transport.choose_instance(None, auto_start=False).instance_id == "aaaa"
 
 
 def test_purges_stale_registry_when_socket_missing(tmp_cache):

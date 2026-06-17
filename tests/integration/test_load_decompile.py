@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from ghx.transport import send_request
+from ghx.transport import BridgeError, send_request
 
 
 pytestmark = pytest.mark.integration
@@ -84,6 +84,566 @@ def test_load_decompile_rename_roundtrip(running_agent):
         instance_id=running_agent,
     )
     assert any(row["name"] == "ghx_entry" for row in found["result"])
+
+
+def test_structured_il_read_create(running_agent):
+    """P0 parity ops: structured_il, read_bytes, create_function."""
+    load = send_request(
+        "load_binary",
+        params={"path": "/bin/true"},
+        instance_id=running_agent,
+        timeout=120.0,
+    )
+    assert load["ok"] is True
+    program_id = load["result"]["program_id"]
+
+    # --- structured_il (high): the data-flow substrate ---
+    sil = send_request(
+        "structured_il",
+        params={"identifier": "entry", "form": "high"},
+        target=program_id,
+        instance_id=running_agent,
+        timeout=60.0,
+    )
+    assert sil["ok"] is True
+    assert sil["result"]["form"] == "high"
+    assert sil["result"]["op_count"] > 0
+    op0 = sil["result"]["ops"][0]
+    assert isinstance(op0["op"], str)
+    assert isinstance(op0["inputs"], list)
+    assert "address" in op0
+
+    # raw form also works (per-instruction p-code)
+    sil_raw = send_request(
+        "structured_il",
+        params={"identifier": "entry", "form": "raw"},
+        target=program_id,
+        instance_id=running_agent,
+    )
+    assert sil_raw["ok"] is True
+    assert sil_raw["result"]["op_count"] > 0
+
+    # --- read_bytes: cross-check against disasm's first instruction bytes ---
+    dis = send_request(
+        "disasm",
+        params={"identifier": "entry"},
+        target=program_id,
+        instance_id=running_agent,
+    )
+    assert dis["ok"] is True
+    first = dis["result"]["instructions"][0]
+    first_bytes = first["bytes_hex"]
+    rd = send_request(
+        "read_bytes",
+        params={"address": first["address"], "length": len(first_bytes) // 2},
+        target=program_id,
+        instance_id=running_agent,
+    )
+    assert rd["ok"] is True
+    assert rd["result"]["length_read"] == len(first_bytes) // 2
+    assert rd["result"]["bytes_hex"] == first_bytes
+
+    # read_bytes also accepts a symbol name (resolves like xrefs).
+    rd_sym = send_request(
+        "read_bytes",
+        params={"address": "entry", "length": len(first_bytes) // 2},
+        target=program_id,
+        instance_id=running_agent,
+    )
+    assert rd_sym["ok"] is True
+    assert rd_sym["result"]["bytes_hex"] == first_bytes
+
+    # --- create_function: guard rejects an address that's already a function ---
+    info = send_request(
+        "function_info",
+        params={"identifier": "entry"},
+        target=program_id,
+        instance_id=running_agent,
+    )
+    entry_addr = info["result"]["function"]["address"]
+    with pytest.raises(BridgeError) as exc:
+        send_request(
+            "create_function",
+            params={"address": entry_addr},
+            target=program_id,
+            instance_id=running_agent,
+        )
+    assert "already_exists" in str(exc.value)
+
+
+def test_evidence_ops(running_agent):
+    """Tier B composition ops: evidence_function, evidence_xrefs."""
+    load = send_request(
+        "load_binary",
+        params={"path": "/bin/true"},
+        instance_id=running_agent,
+        timeout=120.0,
+    )
+    program_id = load["result"]["program_id"]
+
+    # evidence_function on entry: summary fields present and self-consistent.
+    ev = send_request(
+        "evidence_function",
+        params={"identifier": "entry"},
+        target=program_id,
+        instance_id=running_agent,
+        timeout=60.0,
+    )
+    assert ev["ok"] is True
+    r = ev["result"]
+    assert r["function"]["name"] in ("entry", "_start")
+    assert r["instruction_count"] > 0
+    assert r["call_count"] == len(r["calls"])
+    assert isinstance(r["arg_hints"], list)
+    assert "section" in r  # memory block resolved (or explicitly None)
+
+    # evidence_xrefs on entry: incoming refs carry a section field.
+    info = send_request(
+        "function_info", params={"identifier": "entry"},
+        target=program_id, instance_id=running_agent,
+    )
+    entry_addr = info["result"]["function"]["address"]
+    ex = send_request(
+        "evidence_xrefs",
+        params={"identifier": entry_addr},
+        target=program_id,
+        instance_id=running_agent,
+    )
+    assert ex["ok"] is True
+    assert "incoming" in ex["result"]
+    assert "target_section" in ex["result"]
+    for ref in ex["result"]["incoming"]:
+        assert "section" in ref  # enrichment applied to every incoming ref
+
+
+def test_evidence_init_and_table(running_agent):
+    """Tier B pointer-walking ops: evidence_init, evidence_table."""
+    load = send_request(
+        "load_binary",
+        params={"path": "/bin/true"},
+        instance_id=running_agent,
+        timeout=120.0,
+    )
+    program_id = load["result"]["program_id"]
+
+    # .init_array is present in virtually every PIE/ELF.
+    ev = send_request(
+        "evidence_init",
+        target=program_id,
+        instance_id=running_agent,
+    )
+    assert ev["ok"] is True
+    names = {s["name"] for s in ev["result"]["sections"]}
+    assert ".init_array" in names
+    init = next(s for s in ev["result"]["sections"] if s["name"] == ".init_array")
+    assert init["count"] >= 1
+    # Each entry carries a slot, a value, and a classification.
+    e0 = init["entries"][0]
+    assert e0["slot"].startswith("0x")
+    assert "kind" in e0
+
+    # Reading the same .init_array as a generic pointer table resolves the
+    # same first entry.
+    tbl = send_request(
+        "evidence_table",
+        params={"address": init["start"], "count": init["count"], "stop_on_unmapped": False},
+        target=program_id,
+        instance_id=running_agent,
+    )
+    assert tbl["ok"] is True
+    assert tbl["result"]["count"] >= 1
+    assert tbl["result"]["entries"][0]["value"] == init["entries"][0]["value"]
+
+
+def test_evidence_message(running_agent):
+    """Tier B: evidence_message surfaces matching strings with xrefs/section."""
+    import re
+
+    load = send_request(
+        "load_binary",
+        params={"path": "/bin/true"},
+        instance_id=running_agent,
+        timeout=120.0,
+    )
+    program_id = load["result"]["program_id"]
+
+    # Pull a real string token to use as a deterministic query.
+    strings = send_request(
+        "strings",
+        params={"min_length": 4, "limit": 300},
+        target=program_id,
+        instance_id=running_agent,
+    )["result"]
+    query = None
+    for row in strings:
+        match = re.search(r"[A-Za-z]{4,}", row["value"])
+        if match:
+            query = match.group(0)
+            break
+    assert query is not None, "no usable string token found in /bin/true"
+
+    res = send_request(
+        "evidence_message",
+        params={"query": query},
+        target=program_id,
+        instance_id=running_agent,
+    )
+    assert res["ok"] is True
+    assert res["result"]["match_count"] >= 1
+    assert any(query in m["value"] for m in res["result"]["matches"])
+    m0 = res["result"]["matches"][0]
+    assert "section" in m0 and "xrefs" in m0 and "xref_count" in m0
+
+
+def test_dataflow_defuse(running_agent):
+    """Tier A: SSA def/use for a real variable discovered from the binary."""
+    load = send_request(
+        "load_binary",
+        params={"path": "/bin/true"},
+        instance_id=running_agent,
+        timeout=120.0,
+    )
+    program_id = load["result"]["program_id"]
+    funcs = send_request(
+        "list_functions", params={"limit": 50},
+        target=program_id, instance_id=running_agent,
+    )["result"]
+
+    found = None
+    for f in funcs:
+        if f.get("is_thunk") or f.get("is_external"):
+            continue
+        # The not_found error enumerates the function's variable names.
+        try:
+            send_request(
+                "dataflow_defuse",
+                params={"identifier": f["address"], "variable": "__ghx_nope__"},
+                target=program_id, instance_id=running_agent, timeout=60.0,
+            )
+            continue
+        except BridgeError as exc:
+            msg = str(exc)
+            if "available:" not in msg:
+                continue
+            names = [n.strip() for n in msg.split("available:", 1)[1].split(",") if n.strip()]
+        for var in names[:8]:
+            try:
+                r = send_request(
+                    "dataflow_defuse",
+                    params={"identifier": f["address"], "variable": var},
+                    target=program_id, instance_id=running_agent, timeout=60.0,
+                )
+            except BridgeError:
+                continue
+            if r["ok"]:
+                found = (var, r["result"])
+                break
+        if found:
+            break
+
+    if found is None:
+        import pytest as _pytest
+        _pytest.skip("no named SSA variable found in /bin/true sample")
+
+    var, res = found
+    assert res["variable"] == var
+    assert res["instance_count"] == len(res["instances"])
+    # Each instance has a varnode descriptor and a use list.
+    for inst in res["instances"]:
+        assert "varnode" in inst
+        assert inst["use_count"] == len(inst["uses"])
+
+
+def test_taint_backward(running_agent):
+    """Tier A: backward slice of a real call argument to its origins."""
+    load = send_request(
+        "load_binary",
+        params={"path": "/bin/true"},
+        instance_id=running_agent,
+        timeout=120.0,
+    )
+    program_id = load["result"]["program_id"]
+    funcs = send_request(
+        "list_functions", params={"limit": 50},
+        target=program_id, instance_id=running_agent,
+    )["result"]
+
+    chosen = None
+    for f in funcs:
+        if f.get("is_thunk") or f.get("is_external"):
+            continue
+        sil = send_request(
+            "structured_il", params={"identifier": f["address"], "form": "high"},
+            target=program_id, instance_id=running_agent, timeout=60.0,
+        )["result"]
+        for op in sil["ops"]:
+            # A CALL with at least one argument (inputs = target + >=1 arg).
+            if op["op"] in ("CALL", "CALLIND") and len(op.get("inputs", [])) >= 2:
+                chosen = (f["address"], op["address"])
+                break
+        if chosen:
+            break
+
+    if chosen is None:
+        import pytest as _pytest
+        _pytest.skip("no call-with-arg found in /bin/true sample")
+
+    fn_addr, call_addr = chosen
+    res = send_request(
+        "taint_backward",
+        params={"identifier": fn_addr, "address": call_addr, "arg": 0},
+        target=program_id, instance_id=running_agent, timeout=60.0,
+    )
+    assert res["ok"] is True
+    r = res["result"]
+    assert r["start"]["kind"] == "call_arg"
+    assert r["start"]["address"] == call_addr
+    assert r["origin_count"] == len(r["origins"])
+    # A slice to origins must bottom out in at least one classified leaf.
+    assert r["origin_count"] >= 1
+    assert all("kind" in o for o in r["origins"])
+
+
+def test_dataflow_callgraph(running_agent):
+    """Tier A: resolved direct callees/callers around entry."""
+    load = send_request(
+        "load_binary",
+        params={"path": "/bin/true"},
+        instance_id=running_agent,
+        timeout=120.0,
+    )
+    program_id = load["result"]["program_id"]
+
+    cg = send_request(
+        "dataflow_callgraph",
+        params={"identifier": "entry", "direction": "both", "depth": 2},
+        target=program_id, instance_id=running_agent, timeout=60.0,
+    )
+    assert cg["ok"] is True
+    r = cg["result"]
+    assert r["depth"] == 2
+    assert "callees" in r and "callers" in r
+    # entry calls __libc_start_main — a resolvable direct callee.
+    callee_names = {n["name"] for n in r["callees"]}
+    assert any("libc_start_main" in n for n in callee_names)
+    # Every callee node carries a level and address.
+    for n in r["callees"]:
+        assert 1 <= n["level"] <= 2
+        assert n["address"].startswith("0x")
+    assert isinstance(r.get("indirect_callsites"), int)
+
+
+def test_quick_load_then_refresh(running_agent):
+    """Tier C: --quick load skips analysis; refresh deepens it."""
+    quick = send_request(
+        "load_binary",
+        params={"path": "/bin/true", "quick": True},
+        instance_id=running_agent,
+        timeout=120.0,
+    )
+    assert quick["ok"] is True
+    assert quick["result"]["analyzed"] is False
+    program_id = quick["result"]["program_id"]
+
+    before = send_request(
+        "list_functions", params={"limit": 5000},
+        target=program_id, instance_id=running_agent,
+    )["result"]
+
+    # refresh runs full auto-analysis, which should not error and typically
+    # discovers more functions than a bare import.
+    ref = send_request("refresh", target=program_id, instance_id=running_agent, timeout=120.0)
+    assert ref["ok"] is True
+
+    after = send_request(
+        "list_functions", params={"limit": 5000},
+        target=program_id, instance_id=running_agent,
+    )["result"]
+    assert len(after) >= len(before)
+
+
+def test_save_export_gzf(running_agent, tmp_path):
+    """Tier C: `save <path>` exports a non-empty .gzf archive."""
+    load = send_request(
+        "load_binary",
+        params={"path": "/bin/true"},
+        instance_id=running_agent,
+        timeout=120.0,
+    )
+    program_id = load["result"]["program_id"]
+
+    out = tmp_path / "true_export"
+    res = send_request(
+        "save_database",
+        params={"path": str(out)},
+        target=program_id, instance_id=running_agent, timeout=60.0,
+    )
+    assert res["ok"] is True
+    assert res["result"]["exported"] is True
+    assert res["result"]["format"] == "gzf"
+    written = res["result"]["path"]
+    assert written.endswith(".gzf")
+    import os
+    assert os.path.exists(written) and os.path.getsize(written) > 0
+
+
+def test_stable_local_ids(running_agent):
+    """Tier C: locals carry a storage-stable id; rename-by-id works and the id
+    is unchanged after the rename."""
+    load = send_request(
+        "load_binary",
+        params={"path": "/bin/true"},
+        instance_id=running_agent,
+        timeout=120.0,
+    )
+    program_id = load["result"]["program_id"]
+    funcs = send_request(
+        "list_functions", params={"limit": 50},
+        target=program_id, instance_id=running_agent,
+    )["result"]
+
+    picked = None
+    for f in funcs:
+        if f.get("is_thunk") or f.get("is_external"):
+            continue
+        locals_ = send_request(
+            "list_locals", params={"identifier": f["address"]},
+            target=program_id, instance_id=running_agent,
+        )["result"]["locals"]
+        for lv in locals_:
+            if lv.get("id"):
+                picked = (f["address"], lv)
+                break
+        if picked:
+            break
+
+    if picked is None:
+        import pytest as _pytest
+        _pytest.skip("no stored local with a stable id found")
+
+    fn_addr, lv = picked
+    var_id = lv["id"]
+
+    # Rename by stable id (not by name).
+    res = send_request(
+        "local_rename",
+        params={"identifier": fn_addr, "name": var_id, "new_name": "ghx_renamed"},
+        target=program_id, instance_id=running_agent,
+    )
+    assert res["ok"] is True
+    assert res["result"]["committed"] is True
+
+    # The id is stable: same storage handle after the rename, new name present.
+    after = send_request(
+        "list_locals", params={"identifier": fn_addr},
+        target=program_id, instance_id=running_agent,
+    )["result"]["locals"]
+    match = [x for x in after if x.get("id") == var_id]
+    assert match, f"stable id {var_id} disappeared after rename"
+    assert match[0]["name"] == "ghx_renamed"
+
+
+def test_dataflow_values(running_agent):
+    """Tier A: SymbolicPropogator constant resolution runs and returns shape."""
+    load = send_request(
+        "load_binary",
+        params={"path": "/bin/true"},
+        instance_id=running_agent,
+        timeout=120.0,
+    )
+    program_id = load["result"]["program_id"]
+
+    dis = send_request(
+        "disasm", params={"identifier": "entry"},
+        target=program_id, instance_id=running_agent,
+    )["result"]
+    # Pick an address a few instructions in (still inside the function body).
+    insns = dis["instructions"]
+    query_addr = insns[min(3, len(insns) - 1)]["address"]
+
+    res = send_request(
+        "dataflow_values",
+        params={"identifier": "entry", "address": query_addr},
+        target=program_id, instance_id=running_agent, timeout=60.0,
+    )
+    assert res["ok"] is True
+    r = res["result"]
+    assert r["address"] == query_addr
+    assert isinstance(r["values"], list)
+    assert r["value_count"] == len(r["values"])
+    assert "note" in r  # honest scoping note present
+    for v in r["values"]:
+        assert "register" in v and v["value"].startswith("0x")
+
+
+def test_taint_forward(running_agent):
+    """Tier A: forward-taint scan pipeline runs end-to-end and returns shape."""
+    load = send_request(
+        "load_binary",
+        params={"path": "/bin/true"},
+        instance_id=running_agent,
+        timeout=120.0,
+    )
+    program_id = load["result"]["program_id"]
+
+    # Default run: must return the documented shape (chains may be empty).
+    base = send_request(
+        "taint_forward", params={},
+        target=program_id, instance_id=running_agent, timeout=120.0,
+    )
+    assert base["ok"] is True
+    r = base["result"]
+    assert isinstance(r["chains"], list)
+    assert r["chain_count"] == len(r["chains"])
+    assert r["sources_used"] and r["sinks_used"]
+    assert "note" in r
+
+    # Drive the decompile+slice path: treat real imports as sinks so the scan
+    # actually finds call sites and decompiles their callers.
+    imports = send_request(
+        "imports", target=program_id, instance_id=running_agent,
+    )["result"]
+    names = [i["name"] for i in imports if i.get("name")][:15]
+    if names:
+        res = send_request(
+            "taint_forward", params={"sinks": ",".join(names)},
+            target=program_id, instance_id=running_agent, timeout=120.0,
+        )
+        assert res["ok"] is True
+        assert res["result"]["scanned_functions"] >= 1
+        assert isinstance(res["result"]["chains"], list)
+
+
+def test_callsites_libc_name_not_ambiguous(running_agent):
+    """A libc name resolves to a .plt thunk AND the EXTERNAL symbol; callsites
+    must union them (real callers) instead of raising ambiguous_function."""
+    load = send_request(
+        "load_binary", params={"path": "/bin/true"},
+        instance_id=running_agent, timeout=120.0,
+    )
+    program_id = load["result"]["program_id"]
+
+    imports = send_request(
+        "imports", target=program_id, instance_id=running_agent,
+    )["result"]
+    names = [i["name"] for i in imports if i.get("name")]
+    assert names, "no imports found in /bin/true"
+
+    # At least one imported libc name must resolve through callsites without an
+    # ambiguity error and return the documented shape.
+    ok_any = False
+    for name in names[:20]:
+        resp = send_request(
+            "callsites", params={"identifier": name},
+            target=program_id, instance_id=running_agent,
+        )
+        assert resp["ok"] is True, f"callsites {name} errored: {resp}"
+        assert "callsites" in resp["result"]
+        # No site may be the thunk's own internal trampoline (caller == callee).
+        for site in resp["result"]["callsites"]:
+            assert site.get("caller") != site.get("callee")
+        ok_any = ok_any or bool(resp["result"]["callsites"])
+    assert ok_any, "no callsites resolved for any imported name"
 
 
 def test_py_exec_read_only(running_agent):

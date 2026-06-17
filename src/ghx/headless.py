@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--install-dir",
         help="Ghidra installation directory "
-             "(defaults to $GHIDRA_INSTALL_DIR or /opt/ghidra_12.0.4_PUBLIC)",
+             "(defaults to $GHIDRA_INSTALL_DIR or /opt/ghidra_12.1.2_PUBLIC)",
         default=None,
     )
     parser.add_argument(

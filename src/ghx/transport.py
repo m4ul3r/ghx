@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import pins
 from .paths import bridge_registry_path, bridge_socket_path, instances_dir
 
 
@@ -125,6 +126,13 @@ def choose_instance(instance_id: str | None = None, *, auto_start: bool = True) 
             if inst.instance_id == instance_id or instance_selector(inst) == instance_id:
                 return inst
         raise BridgeError(f"No ghx bridge instance found with id: {instance_id}")
+    # No explicit selection: honour a sticky pin if it points at a live
+    # instance. A stale/absent pin falls through to normal resolution.
+    pinned = pins.get_instance()
+    if pinned:
+        for inst in instances:
+            if inst.instance_id == pinned or instance_selector(inst) == pinned:
+                return inst
     if len(instances) == 1:
         return instances[0]
     if instances:

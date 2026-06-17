@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 PLUGIN_NAME = "ghx_agent_bridge"
-DEFAULT_GHIDRA_INSTALL_DIR = "/opt/ghidra_12.0.4_PUBLIC"
+DEFAULT_GHIDRA_INSTALL_DIR = "/opt/ghidra_12.1.2_PUBLIC"
 
 
 def repo_root() -> Path:
@@ -44,6 +44,11 @@ def instances_dir() -> Path:
     return cache_home() / "instances"
 
 
+def pin_path() -> Path:
+    """Path to the CLI pin file (sticky instance/target selection)."""
+    return cache_home() / "pins.json"
+
+
 def bridge_registry_path(instance_id: str | None = None) -> Path:
     if instance_id is None:
         return cache_home() / f"{PLUGIN_NAME}.json"
@@ -56,8 +61,29 @@ def bridge_socket_path(instance_id: str | None = None) -> Path:
     return instances_dir() / f"{instance_id}.sock"
 
 
+def _has_dot_element(path: Path) -> bool:
+    """True if any component of *path* starts with '.' — Ghidra's
+    ProjectLocator rejects such paths."""
+    try:
+        parts = path.expanduser().resolve().parts
+    except Exception:
+        parts = path.parts
+    return any(part.startswith(".") for part in parts)
+
+
 def projects_dir() -> Path:
-    return cache_home() / "projects"
+    """Base directory for ephemeral Ghidra projects.
+
+    Ghidra's ``ProjectLocator`` forbids any path element starting with ``.``,
+    so the default cache home (``~/.cache/ghx`` — the ``.cache`` element)
+    cannot host a project and the daemon would fail to open one. Use the cache
+    home only when it has no dotted element; otherwise fall back to the system
+    temp dir (these projects are throwaway scratch, like spills).
+    """
+    base = cache_home()
+    if not _has_dot_element(base):
+        return base / "projects"
+    return Path(tempfile.gettempdir()) / "ghx-projects"
 
 
 def spill_root() -> Path:

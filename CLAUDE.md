@@ -15,7 +15,7 @@ Two processes over a Unix domain socket:
 ```
   ghx (CLI)                            ghx-agent (daemon)
   ─────────                            ──────────────────
-  Python 3.11-3.13, argparse           PyGhidra + JPype + Ghidra 12.0.4
+  Python 3.11-3.13, argparse           PyGhidra + JPype + Ghidra 12.1.2
   no Ghidra imports at all             one JVM, one Project, N Programs
   src/ghx/{cli,transport,output}.py    plugin/ghx_agent_bridge/bridge.py
                                        └─ BridgeHandler (socketserver)
@@ -116,7 +116,7 @@ uv run pytest -m integration  # integration tests (boots a real ghx-agent)
 ```
 
 Integration tests auto-skip if `GHIDRA_INSTALL_DIR` is unset and
-`/opt/ghidra_12.0.4_PUBLIC` is absent. They use a per-test `GHX_CACHE_DIR`
+`/opt/ghidra_12.1.2_PUBLIC` is absent. They use a per-test `GHX_CACHE_DIR`
 under `tmp_path` so they don't collide with a running developer daemon.
 
 ## Key files
@@ -138,8 +138,9 @@ under `tmp_path` so they don't collide with a running developer daemon.
 - **GUI extension plugin** (phase 2: a Java Ghidra extension that runs the
   same socket server inside a live Ghidra GUI, so a human can drive the
   GUI while the CLI issues ops against the same analysis state).
-- **`ghx save <alternate-path>`** — `ghx save` persists the Program to its
-  existing DomainFile; writing to an alternate path would require
-  `project.saveAs(...)` and isn't wired up.
+- **`ghx save <alternate-path>` via `project.saveAs(...)`** — not wired.
+  However, `ghx save <path>` *is* implemented as a Ghidra Zip File (`.gzf`)
+  export via `GzfExporter` (the analyzed-program archive). A true in-project
+  `saveAs` to a new DomainFile path is still out of scope.
 - **Retrieving `program.save(msg, monitor)` return values** — Ghidra
   persists atomically per-transaction anyway.
