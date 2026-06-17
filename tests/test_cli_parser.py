@@ -166,6 +166,8 @@ def test_version_is_exposed(parser, capsys):
         ["taint", "backward", "main", "--at", "0x401050", "--arg", "0"],
         ["taint", "backward", "main", "--variable", "buf"],
         ["taint", "backward", "main", "--variable", "buf", "--max-depth", "100"],
+        ["taint", "backward", "main", "--at", "0x401050", "--arg", "0", "--interprocedural"],
+        ["trace", "main", "--at", "0x401050", "--interprocedural", "--ip-depth", "4"],
         ["trace", "main", "--at", "0x401050"],
         ["trace", "main", "--at", "0x401050", "--arg", "1"],
         ["trace", "main", "--at", "0x401050", "--max-depth", "25"],

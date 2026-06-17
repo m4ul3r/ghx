@@ -1937,6 +1937,20 @@ def _render_backward_slice(r, out):
         else:
             vn = o.get("varnode", {})
             out.write(f"  input   {o.get('name') or vn.get('register') or vn.get('kind')}\n")
+    ip = r.get("interprocedural_origins")
+    if r.get("interprocedural"):
+        out.write(f"interprocedural origins ({r.get('interprocedural_origin_count', 0)}):\n")
+        for o in ip or []:
+            kind = o.get("kind")
+            label = (
+                o.get("value") if kind == "const"
+                else o.get("name") if kind in ("parameter", "global")
+                else (o.get("callee") or "<indirect>") if kind == "call_result"
+                else o.get("address") if kind == "load"
+                else o.get("name") or o.get("varnode", {}).get("register") or "?"
+            )
+            path = " -> ".join(o.get("path", []))
+            out.write(f"  {kind:<8} {label}   [{path}]\n")
 
 
 def _send_taint_backward(ns: argparse.Namespace, label: str) -> int:
@@ -1948,6 +1962,8 @@ def _send_taint_backward(ns: argparse.Namespace, label: str) -> int:
             arg=getattr(ns, "arg", None),
             variable=getattr(ns, "variable", None),
             max_steps=getattr(ns, "max_depth", None),
+            interprocedural=getattr(ns, "interprocedural", False) or None,
+            ip_depth=getattr(ns, "ip_depth", None),
         )
     except BridgeError as exc:
         print(f"ghx {label}: {exc}", file=sys.stderr)
@@ -2022,6 +2038,10 @@ def cmd_taint_forward(ns: argparse.Namespace) -> int:
         arg("--variable", default=None, help="Slice a named variable instead of a call arg"),
         arg("--max-depth", type=int, default=None,
             help="Max SSA slice steps before truncation (default: 400)"),
+        arg("--interprocedural", action="store_true",
+            help="Continue the slice into callers when it reaches a parameter"),
+        arg("--ip-depth", type=int, default=None,
+            help="Max caller frames to cross with --interprocedural (default: 3)"),
     ],
 )
 def cmd_taint_backward(ns: argparse.Namespace) -> int:
@@ -2038,6 +2058,10 @@ def cmd_taint_backward(ns: argparse.Namespace) -> int:
         arg("--arg", type=int, default=0, help="0-based argument index (default: 0)"),
         arg("--max-depth", type=int, default=None,
             help="Max SSA slice steps before truncation (default: 400)"),
+        arg("--interprocedural", action="store_true",
+            help="Continue the slice into callers when it reaches a parameter"),
+        arg("--ip-depth", type=int, default=None,
+            help="Max caller frames to cross with --interprocedural (default: 3)"),
     ],
 )
 def cmd_trace(ns: argparse.Namespace) -> int:

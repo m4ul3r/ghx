@@ -260,11 +260,16 @@ concrete bn behavior to match.
   stack/frame/link/pc registers (sp, fp, lr, pc, x29, x30, rbp/rsp/rip, …). On
   `fw-A/bin-1` it cut `sp/x29/x30` from the output, leaving the meaningful
   `x0/x1/x19/x23/x27`.
-- [~] **`trace` depth flags.** Added `--max-depth` (bounds the SSA slice;
-  verified truncation on `fw-A/bin-1`). Still TODO: `--interprocedural`/
-  `--ip-depth` (follow return values across call boundaries) — a larger item.
-  `--view {mlil,hlil}` has no clean Ghidra analogue (the slice runs on high
-  p-code only); documented as N/A rather than faked.
+- [x] **`trace` depth flags.** `--max-depth` bounds the SSA slice (verified
+  truncation on `fw-A/bin-1`). `--interprocedural`/`--ip-depth` now continue the
+  backward slice ACROSS call boundaries: when it bottoms out at a parameter of
+  the function, it walks to each caller, slices the actual arg they pass, and
+  reports those origins in ancestor frames with the call `path`
+  (`interprocedural_origins`). Shares `_interproc_backward` with the taint
+  machinery; same conservative param→arg mapping (missing signatures
+  under-report). Verified on a built fixture: tracing a memcpy src crosses
+  `copy_it → process → reader`. (`--view {mlil,hlil}` still N/A — the slice runs
+  on high p-code only; documented, not faked.)
 - [x] **`taint backward` arg model** — added `--max-depth` (shared
   `_send_taint_backward`, maps to the op's `max_steps`). ghx's
   `--at/--arg/--variable` is the working analogue of bn's
@@ -393,6 +398,12 @@ already loaded speeds the loop. Keep all captured artifacts under `.dogfood/`.
 
 ## Progress ledger (append one line per cycle — newest first)
 
+- 2026-06-17 — **`trace --interprocedural` + `types list --count`.** trace/taint
+  backward now continue the SSA slice across call frames when it reaches a
+  parameter (walk to callers, slice the actual arg, report ancestor-frame origins
+  with the call path) via shared `_interproc_backward`; verified on a fixture
+  (memcpy src crosses copy_it→process→reader). Added `--count` to `types list`
+  (bn parity; verified on /bin/ls). 188 unit green; integration extended.
 - 2026-06-17 — **Corpus validation + imports data-symbol fix.** Ran the A/B
   harness on `/bin/ls` (x86-64 PIE) beside bin-1 (AArch64). It surfaced a REAL
   gap bin-1 lacked: `imports` missed imported DATA objects (stderr/stdout/optarg/

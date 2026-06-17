@@ -790,6 +790,29 @@ def test_taint_forward_out_buffer_source(running_agent, tmp_path):
         "interprocedural must not introduce a false chain in f_no_chain"
     )
 
+    # trace --interprocedural: slicing ip_copy's memcpy src backward must cross
+    # call frames (into ip_process / ip_reader) rather than stop at the param.
+    sites = send_request(
+        "callsites", params={"identifier": "memcpy"},
+        target=program_id, instance_id=running_agent,
+    )["result"]["callsites"]
+    in_copy = [s for s in sites if s.get("caller") == "ip_copy"]
+    assert in_copy, f"no memcpy call site in ip_copy: {sites}"
+    call_addr = in_copy[0]["call_addr"]
+    tb = send_request(
+        "taint_backward",
+        params={"identifier": "ip_copy", "address": call_addr, "arg": 1,
+                "interprocedural": True, "ip_depth": 4},
+        target=program_id, instance_id=running_agent, timeout=120.0,
+    )["result"]
+    assert tb.get("interprocedural") is True
+    ip_origins = tb.get("interprocedural_origins", [])
+    assert ip_origins, "expected interprocedural origins crossing call frames"
+    frames = {f for o in ip_origins for f in o.get("path", [])}
+    assert any("ip_process" in f for f in frames), (
+        f"slice should cross into ip_process; frames={frames}"
+    )
+
 
 def test_xrefs_by_name_unions_thunks(running_agent):
     """A libc name resolves to BOTH a .plt thunk and the EXTERNAL stub; xrefs by

@@ -2960,6 +2960,61 @@ class GhxBridge:
                         work.append((caller, pj, depth - 1, path + [frame]))
         return results
 
+    def _interproc_backward(
+        self, program: Any, iface: Any, state: dict[str, Any], fn: Any,
+        param_idx: int, ip_depth: int, max_steps: int, timeout: int,
+    ) -> list[dict[str, Any]]:
+        """Continue a backward slice ACROSS call boundaries: when a slice in *fn*
+        reaches parameter *param_idx*, walk to each caller, slice the actual
+        argument it passes, and collect those origins (tagged with the caller
+        frame and path). Recurse up to ip_depth frames. Same conservative
+        param->arg mapping as `_interproc_taint`: missing signatures under-report."""
+        fm = program.getFunctionManager()
+        rm = program.getReferenceManager()
+        results: list[dict[str, Any]] = []
+        seen_out: set[str] = set()
+        work: list[tuple] = [(fn, param_idx, ip_depth, [])]
+        visited: set[tuple] = set()
+        while work:
+            cur_fn, pidx, depth, path = work.pop()
+            vkey = (int(cur_fn.getEntryPoint().getOffset()), pidx)
+            if vkey in visited:
+                continue
+            visited.add(vkey)
+            for ref in rm.getReferencesTo(cur_fn.getEntryPoint()):
+                if not ref.getReferenceType().isCall():
+                    continue
+                from_addr = ref.getFromAddress()
+                from_off = int(from_addr.getOffset())
+                caller = fm.getFunctionContaining(from_addr)
+                if caller is None or caller.isThunk():
+                    continue
+                high = self._decompile(iface, caller, timeout, state)
+                if high is None:
+                    continue
+                call_op = self._find_call_op(high, from_off)
+                if call_op is None:
+                    continue
+                cin = list(call_op.getInputs())
+                slot = pidx + 1
+                if slot >= len(cin):
+                    continue  # decompiler didn't model that arg -> conservative
+                _, origins, _ = _backward_slice(cin[slot], program, max_steps)
+                frame = f"{caller.getName()}@0x{from_off:x}"
+                frames = path + [frame]
+                for o in origins:
+                    rec = dict(o)
+                    rec["frame"] = str(caller.getName())
+                    rec["path"] = frames
+                    dk = json.dumps(rec, sort_keys=True)
+                    if dk not in seen_out:
+                        seen_out.add(dk)
+                        results.append(rec)
+                    if (depth > 0 and o.get("kind") == "parameter"
+                            and o.get("param_index") is not None):
+                        work.append((caller, int(o["param_index"]), depth - 1, frames))
+        return results
+
     def _op_taint_forward(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
         """Forward taint: report source->sink chains. Intraprocedural by default,
         two ways: (a) return_value — a sink arg backward-slices to a source
@@ -3195,15 +3250,18 @@ class GhxBridge:
             raise OperationFailure("bad_request", "taint_backward requires 'identifier'")
         fn = _resolve_function(program, str(identifier))
 
-        with self._high_function(program, fn, int(params.get("timeout", 60))) as high:
+        interprocedural = bool(params.get("interprocedural"))
+        ip_depth = int(params.get("ip_depth", 3))
+        max_steps = int(params.get("max_steps", 400))
+        timeout = int(params.get("timeout", 60))
+
+        with self._high_function(program, fn, timeout) as high:
             start, start_desc = self._resolve_slice_start(
                 high, program, params.get("address"), params.get("arg"),
                 params.get("variable"),
             )
-            slice_ops, origins, truncated = _backward_slice(
-                start, program, int(params.get("max_steps", 400))
-            )
-            return {
+            slice_ops, origins, truncated = _backward_slice(start, program, max_steps)
+            result: dict[str, Any] = {
                 "function": _func_brief(fn),
                 "start": start_desc,
                 "slice_len": len(slice_ops),
@@ -3212,6 +3270,29 @@ class GhxBridge:
                 "origins": origins,
                 "truncated": truncated,
             }
+
+        # Interprocedural: where the slice bottomed out at a parameter of `fn`,
+        # continue it in `fn`'s callers (the actual arg they pass), collecting
+        # origins in ancestor frames with the call path.
+        if interprocedural:
+            param_idxs = {
+                int(o["param_index"]) for o in origins
+                if o.get("kind") == "parameter" and o.get("param_index") is not None
+            }
+            ip_origins: list[dict[str, Any]] = []
+            if param_idxs:
+                ip_state = {"cache": {}, "decompiles": 0, "cap": 400}
+                with self._decompiler(program) as ip_iface:
+                    for pidx in param_idxs:
+                        ip_origins.extend(self._interproc_backward(
+                            program, ip_iface, ip_state, fn, pidx,
+                            ip_depth, max_steps, timeout,
+                        ))
+            result["interprocedural"] = True
+            result["ip_depth"] = ip_depth
+            result["interprocedural_origins"] = ip_origins
+            result["interprocedural_origin_count"] = len(ip_origins)
+        return result
 
     def _callgraph_walk(self, program: Any, root_fn: Any, depth: int, mode: str) -> list[dict[str, Any]]:
         """BFS the call graph from *root_fn* up to *depth* levels. mode is
