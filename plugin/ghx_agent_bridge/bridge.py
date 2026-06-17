@@ -2720,11 +2720,12 @@ class GhxBridge:
         return {_normalize_fn_name(n.strip()) for n in names if str(n).strip()}
 
     def _op_taint_forward(self, params: dict[str, Any], target: str | None) -> dict[str, Any]:
-        """Forward taint (v1, intraprocedural): report source->sink chains where
-        a sink-call argument backward-slices to a source call's return value
-        within one function. Cross-function propagation and a source's
-        out-buffer (e.g. recv(fd, buf, ..)) are NOT modeled — 0 chains is not an
-        all-clear."""
+        """Forward taint (intraprocedural): report source->sink chains within
+        one function, two ways. (a) return_value: a sink arg backward-slices to
+        a source call's return value. (b) out_buffer: a sink arg refers to a
+        buffer a preceding source call WROTE via an out-parameter (read/recv/
+        fgets/getline/...). Cross-function propagation is still NOT modeled, so
+        0 chains is not an all-clear."""
         handle = self.targets.resolve(params.get("target") or target, required=True)
         assert handle is not None
         program = handle.program
@@ -2766,12 +2767,44 @@ class GhxBridge:
             scanned += 1
             try:
                 with self._high_function(program, caller, timeout) as high:
+                    stack_syms = _stack_symbol_map(high)
+
+                    # Source out-buffer sites in this function: where a source
+                    # WRITES a buffer (read/recv/fgets/getline/...), keyed so a
+                    # later sink argument referring to the same buffer matches.
+                    src_bufs: list[dict[str, Any]] = []
+                    op_it = high.getPcodeOps()
+                    while op_it.hasNext():
+                        op = op_it.next()
+                        if str(op.getMnemonic()) not in ("CALL", "CALLIND"):
+                            continue
+                        callee = _callop_callee_name(program, op)
+                        if callee not in sources:
+                            continue
+                        buf_idx = _TAINT_SOURCE_OUTBUF.get(callee)
+                        if buf_idx is None:
+                            continue
+                        op_inputs = list(op.getInputs())
+                        slot = buf_idx + 1  # input[0] is the call target
+                        if slot >= len(op_inputs):
+                            continue
+                        keys = _buffer_keys(op_inputs[slot], stack_syms)
+                        if keys:
+                            src_bufs.append({
+                                "name": callee,
+                                "off": int(op.getSeqnum().getTarget().getOffset()),
+                                "keys": keys,
+                            })
+
+                    seen_out: set[tuple] = set()
                     for call_off, sink_name in info["sites"]:
                         call_op = self._find_call_op(high, call_off)
                         if call_op is None:
                             continue
                         inputs = list(call_op.getInputs())
                         for arg_idx in range(1, len(inputs)):
+                            # (a) return-value chains: sink arg backward-slices
+                            # to a source CALL's return value.
                             _, origins, truncated = _backward_slice(
                                 inputs[arg_idx], program, max_steps
                             )
@@ -2787,20 +2820,47 @@ class GhxBridge:
                                             "sink": sink_name,
                                             "sink_at": f"0x{call_off:x}",
                                             "arg": arg_idx - 1,
+                                            "via": "return_value",
                                             "origins": origins,
                                             "truncated": truncated,
                                         }
                                     )
+                            # (b) out-buffer chains: the sink arg refers to a
+                            # buffer a PRECEDING source call wrote (ordering is
+                            # an intraprocedural heuristic: source_addr < sink).
+                            if src_bufs:
+                                argkeys = _buffer_keys_expanded(
+                                    inputs[arg_idx], stack_syms
+                                )
+                                if argkeys:
+                                    for sb in src_bufs:
+                                        if sb["off"] >= call_off:
+                                            continue
+                                        if not (sb["keys"] & argkeys):
+                                            continue
+                                        dedup = (sb["off"], call_off, arg_idx - 1)
+                                        if dedup in seen_out:
+                                            continue
+                                        seen_out.add(dedup)
+                                        chains.append({
+                                            "function": _func_brief(caller),
+                                            "source": sb["name"],
+                                            "source_at": f"0x{sb['off']:x}",
+                                            "sink": sink_name,
+                                            "sink_at": f"0x{call_off:x}",
+                                            "arg": arg_idx - 1,
+                                            "via": "out_buffer",
+                                        })
             except OperationFailure:
                 # A decompile failure on one function must not abort the scan.
                 continue
 
         sink_callsite_count = sum(len(info["sites"]) for info in sink_sites.values())
         note = (
-            "intraprocedural v1: sink arg -> source-call return within one "
-            "function; a source's out-buffer (e.g. recv(fd,buf,..)) and "
-            "cross-function propagation are NOT modeled, so 0 chains is not an "
-            "all-clear."
+            "intraprocedural: sink arg -> source-call return_value OR a source "
+            "out_buffer (read/recv/fgets/getline/..) written before the sink, "
+            "within one function; cross-function propagation is NOT modeled, so "
+            "0 chains is not an all-clear."
         )
         if scope_fn and sink_callsite_count == 0:
             note = (
@@ -3928,6 +3988,138 @@ def _normalize_fn_name(name: Any) -> str:
         if n.endswith(suffix):
             n = n[: -len(suffix)]
     return n.lstrip("_")
+
+
+# 0-based index of the out-buffer argument each source WRITES. The written
+# buffer (not the return value) is the real taint origin for these. getline/
+# getdelim take a `char **` in arg0; `_buffer_keys` resolves `&line` to the
+# `line` variable, so the double indirection matches uniformly with direct
+# pointers. Variadic scanf-family sources are intentionally absent (the buffer
+# arg can't be picked statically).
+_TAINT_SOURCE_OUTBUF: dict[str, int] = {
+    "read": 1, "pread": 1, "recv": 1, "recvfrom": 1, "readlink": 1,
+    "fgets": 0, "gets": 0, "fread": 0,
+    "getline": 0, "getdelim": 0,
+}
+
+
+def _signed(val: int, size: int) -> int:
+    """Interpret an unsigned varnode/const offset as a signed integer."""
+    bits = size * 8
+    if bits > 0 and val >= (1 << (bits - 1)):
+        val -= 1 << bits
+    return val
+
+
+def _callop_callee_name(program: Any, op: Any) -> str | None:
+    """Normalized callee name of a CALL/CALLIND high-pcode op, or None. input[0]
+    of a direct CALL is the target address varnode."""
+    try:
+        inputs = op.getInputs()
+        if not inputs:
+            return None
+        ca = inputs[0].getAddress()
+        if ca is None:
+            return None
+        fm = program.getFunctionManager()
+        fn = fm.getFunctionAt(ca) or fm.getFunctionContaining(ca)
+        return _normalize_fn_name(fn.getName()) if fn is not None else None
+    except Exception:
+        return None
+
+
+def _stack_symbol_map(high: Any) -> dict[int, str]:
+    """{stack offset -> storage id} for a function's stack-backed symbols, so a
+    `&stackvar` PTRSUB(frame, off) can be resolved to the variable living at
+    that offset (the getline `&line` -> `line` case)."""
+    out: dict[int, str] = {}
+    try:
+        it = high.getLocalSymbolMap().getSymbols()
+    except Exception:
+        return out
+    while it.hasNext():
+        sym = it.next()
+        st = _high_sym_storage(sym)
+        try:
+            if st is not None and st.isStackStorage():
+                out[int(st.getStackOffset())] = _storage_id(st)
+        except Exception:
+            continue
+    return out
+
+
+def _buffer_keys(vn: Any, stack_syms: dict[int, str]) -> set:
+    """Identity keys for the memory buffer a varnode denotes, used to match a
+    source's out-buffer argument against a sink argument within one function:
+
+      (1) the variable's own storage  — a heap pointer held in a stack slot or
+          register, and the value side of a getline double pointer (`line`);
+      (2) a `&stackvar` address expression PTRSUB((register,_,_), OFF) — both as
+          an address identity (matches `&buf` on both sides for stack arrays)
+          and resolved through the stack-symbol map to the variable at OFF.
+
+    Empirically the PTRSUB offset equals the Stack[OFF] storage offset on both
+    x86-64 (frame reg 0x20) and AArch64 (0x8), so the resolution is arch-robust.
+    """
+    keys: set = set()
+    if vn is None:
+        return keys
+    try:
+        hv = vn.getHigh()
+        sym = hv.getSymbol() if hv is not None else None
+        if sym is not None:
+            sid = _storage_id(_high_sym_storage(sym))
+            if sid:
+                keys.add(("stor", sid))
+    except Exception:
+        pass
+    try:
+        defop = vn.getDef()
+        if defop is not None and str(defop.getMnemonic()) == "PTRSUB":
+            ip = list(defop.getInputs())
+            if len(ip) == 2 and ip[1].isConstant():
+                off = _signed(int(ip[1].getOffset()), ip[1].getSize())
+                keys.add(("addr", str(ip[0]), off))
+                if off in stack_syms:
+                    keys.add(("stor", stack_syms[off]))
+    except Exception:
+        pass
+    return keys
+
+
+def _buffer_keys_expanded(vn: Any, stack_syms: dict[int, str], depth: int = 3) -> set:
+    """`_buffer_keys` plus a shallow walk through copies/casts and pointer+const
+    arithmetic, so `buf + off` and renamed copies still match the source buffer.
+    Deliberately does NOT cross PTRSUB bases, phi (MULTIEQUAL) merges, or
+    non-constant additions — those would over-connect distinct buffers and the
+    correctness bar is "no false chains"."""
+    keys: set = set()
+    seen: set[str] = set()
+    work = [(vn, 0)]
+    while work:
+        v, d = work.pop()
+        if v is None:
+            continue
+        vk = str(v)
+        if vk in seen:
+            continue
+        seen.add(vk)
+        keys |= _buffer_keys(v, stack_syms)
+        if d >= depth:
+            continue
+        defop = v.getDef()
+        if defop is None:
+            continue
+        mnem = str(defop.getMnemonic())
+        ins = list(defop.getInputs())
+        if mnem in ("COPY", "CAST"):
+            if ins and not ins[0].isConstant():
+                work.append((ins[0], d + 1))
+        elif mnem in ("INT_ADD", "PTRADD"):
+            nonconst = [i for i in ins if not i.isConstant()]
+            if len(nonconst) == 1:
+                work.append((nonconst[0], d + 1))
+    return keys
 
 
 def _direct_callees(program: Any, fn: Any) -> tuple[dict[int, dict[str, Any]], int]:

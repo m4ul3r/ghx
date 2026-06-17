@@ -189,33 +189,34 @@ concrete bn behavior to match.
   retry" remediation (`cli.py:_render_doctor`).
 
 ### P1 — VR-core depth (the reason this tool exists; friction log rows 5-8,12)
-- [ ] **Forward-taint out-buffer source.** `getline/read/fgets/recv` write into
-  `*buf`; that written buffer is the real taint source and is currently
-  untracked, so whole-binary `taint forward` reports `chain_count=0` on binaries
-  that obviously flow input→parse→`memcpy`. Model out-parameter writes as taint
-  origins. *Biggest single dataflow gap.* Design worked out 2026-06-17 (do this
-  in a focused pass — it needs iterative validation against a known source→sink):
-  - **Out-arg map** (0-based buffer arg per source): direct pointers —
-    `read`/`pread`/`recv`/`recvfrom`=1, `fgets`/`gets`/`fread`=0; double pointer —
-    `getline`/`getdelim` arg0 is `char **`, the buffer is `*arg0` (HARDER).
-  - **Same-buffer match:** within the caller's HighFunction, capture each source
-    call's out-buffer arg varnode and key it by its HighVariable (use
-    `_high_var_key`: symbol storage via `_high_sym_storage`/`_storage_id`, else
-    `id(hv)` — object identity is stable within one HighFunction). For each sink
-    arg, match its HighVariable key (and a shallow backward-slice of it, to cover
-    `buf+off`) against the source-buffer keys. On match with source_addr <
-    sink_addr (intraprocedural ordering heuristic), emit a chain with
-    `via:"out_buffer"` (existing return-value chains get `via:"return_value"`).
-  - **getline gotcha (the dogfood target's ONLY source):** arg0 is `&line`; the
-    tainted variable is `line`. Resolve `&local` → the local's HighVariable
-    (PTRSUB(stackbase, off) → stack var) before keying, or the match misses.
-    Validate specifically against the getline→…→memcpy path on `fw-A/bin-1`.
-  - **Correctness bar:** a false chain is worse than today's honest
-    "0 chains ≠ all-clear". Only ship once positively verified on a real chain;
-    keep the honest `note`.
-- [ ] **`taint forward` interprocedural.** Today it is intraprocedural v1; bn
-  follows source→sink across calls. Add interprocedural propagation (mirror
-  `trace --interprocedural --ip-depth`).
+- [x] **Forward-taint out-buffer source.** DONE (intraprocedural). `taint forward`
+  now models out-parameter writes as taint origins: `read/pread/recv/recvfrom/
+  readlink`=arg1, `fgets/gets/fread`=arg0, `getline/getdelim`=arg0 (`char **`).
+  A sink arg referring to such a buffer chains with `via:"out_buffer"` (existing
+  return-value chains now carry `via:"return_value"`). Matching is by buffer
+  identity (`_buffer_keys`): the variable's storage id, plus a `&stackvar`
+  `PTRSUB((register,_,_),OFF)` resolved through the function's stack-symbol map —
+  empirically the PTRSUB offset equals the `Stack[OFF]` storage offset on both
+  x86-64 (frame reg 0x20) and AArch64 (0x8), so getline's `&line`→`line` resolves
+  arch-robustly. A shallow expansion (`_buffer_keys_expanded`, COPY/CAST + ptr
+  +const) covers `buf+off`, deliberately NOT crossing PTRSUB bases / phi / non-
+  const adds (those would over-connect). Ordering heuristic: source_addr < sink.
+  **Verified** on a built x86-64 fixture (`.dogfood/taint-fixture/`, gitignored):
+  3 patterns chain (stack array `fgets→strcpy`, heap pointer `read→memcpy`,
+  getline double-pointer `getline→strcpy`); the negative control (source taints
+  `a`, sink reads `b`) yields NO chain; and `fw-A/bin-1` still honestly reports 0
+  (its only chain is interprocedural — see below). Integration test compiles its
+  own fixture (skips without gcc); the honest `note` is retained.
+- [ ] **`taint forward` interprocedural.** Today intraprocedural; bn follows
+  source→sink across calls. **This is now the gating item for `fw-A/bin-1`:** its
+  only real chain — `getline` in `FUN_00400f20` → buffer passed down through
+  `FUN_00401b70`/`FUN_004015e0` → `memcpy` in `FUN_004012b0`/`FUN_004014e0` — is
+  INTERprocedural (NO function in bin-1 calls both a source and a sink, verified).
+  The out-buffer design's assumption that intraprocedural matching would catch
+  getline→…→memcpy was wrong; catching it needs interprocedural propagation
+  (mirror `trace --interprocedural --ip-depth`) layered on the out_buffer origin,
+  and must contend with imperfect callee signature recovery (the decompiler shows
+  `FUN_00401b70(iVar4)`). Keep the no-false-chain bar.
 - [x] **`taint forward` output shape.** JSON is key-sorted (so `chain_count`/
   `chains` already lead); the real problem was the *size* of the sources/sinks
   echo. Now rendered as compact single-line strings + explicit
@@ -368,6 +369,19 @@ already loaded speeds the loop. Keep all captured artifacts under `.dogfood/`.
 
 ## Progress ledger (append one line per cycle — newest first)
 
+- 2026-06-17 — **VR-core: forward-taint out-buffer source (intraprocedural).**
+  `taint forward` now treats a source's written out-buffer as a taint origin
+  (out-arg map: read/recv=arg1, fgets/fread=arg0, getline/getdelim=arg0 char**),
+  emitting `via:"out_buffer"` chains (return-value chains now `via:"return_value"`).
+  Buffer matching (`_buffer_keys`/`_buffer_keys_expanded`) keys by storage id and
+  `&stackvar` PTRSUB offset resolved through the stack-symbol map (verified the
+  PTRSUB↔Stack offset convention on x86-64 AND AArch64). Verified on a built
+  fixture (3 positive patterns + a negative control that must NOT chain); bin-1
+  still honestly reports 0. KEY FINDING: bin-1's getline→memcpy chain is
+  INTERprocedural (no function calls both a source and a sink), so the
+  intraprocedural model can't catch it — that now gates on interprocedural taint
+  (next item). +1 integration test (compiles its own fixture, skips w/o gcc);
+  179 unit green.
 - 2026-06-17 — **Semantic reconciliation, cycle 1 (fix against the A/B bar).**
   Drove 3 of 4 structural probes to AGREEMENT and extended the harness:
   (1) `function list/search` hide EXTERNAL-block synthetic thunks by default

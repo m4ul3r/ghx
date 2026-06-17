@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 
 import pytest
 
@@ -644,6 +645,63 @@ def test_callsites_libc_name_not_ambiguous(running_agent):
             assert site.get("caller") != site.get("callee")
         ok_any = ok_any or bool(resp["result"]["callsites"])
     assert ok_any, "no callsites resolved for any imported name"
+
+
+_TAINT_FIXTURE_C = r"""
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+void f_stack_array(FILE *fp){char buf[128],dst[128];fgets(buf,sizeof buf,fp);strcpy(dst,buf);puts(dst);}
+void f_heap_ptr(int fd){char *buf=malloc(256),dst[256];read(fd,buf,256);memcpy(dst,buf,100);puts(dst);}
+void f_getline(FILE *fp){char *line=NULL,dst[256];size_t n=0;getline(&line,&n,fp);strcpy(dst,line);puts(dst);free(line);}
+void f_no_chain(FILE *fp){char a[128],b[128],dst[128];fgets(a,sizeof a,fp);memset(b,0,sizeof b);strcpy(dst,b);puts(dst);}
+int main(int c,char**v){(void)c;(void)v;f_stack_array(stdin);f_heap_ptr(0);f_getline(stdin);f_no_chain(stdin);return 0;}
+"""
+
+
+def test_taint_forward_out_buffer_source(running_agent, tmp_path):
+    """A source that writes through an out-parameter (fgets/read/getline) is a
+    taint origin: the sink reading that buffer must chain via 'out_buffer'.
+    Covers a stack array, a heap pointer, and getline's char** double pointer;
+    f_no_chain (source taints `a`, sink reads `b`) must NOT produce a chain."""
+    import shutil
+    gcc = shutil.which("gcc")
+    if gcc is None:
+        pytest.skip("gcc not available to build the taint fixture")
+    src = tmp_path / "tt.c"
+    src.write_text(_TAINT_FIXTURE_C)
+    binp = tmp_path / "tt"
+    cp = subprocess.run(
+        [gcc, "-O0", "-fno-stack-protector", "-fno-inline", "-o", str(binp), str(src)],
+        capture_output=True, text=True,
+    )
+    if cp.returncode != 0:
+        pytest.skip(f"fixture build failed: {cp.stderr[:200]}")
+
+    load = send_request(
+        "load_binary", params={"path": str(binp)},
+        instance_id=running_agent, timeout=120.0,
+    )
+    program_id = load["result"]["program_id"]
+
+    res = send_request(
+        "taint_forward", target=program_id, instance_id=running_agent, timeout=120.0,
+    )["result"]
+    chains = res["chains"]
+
+    # Every positive function must yield an out_buffer chain.
+    by_fn = {}
+    for c in chains:
+        by_fn.setdefault(c["function"]["name"], []).append(c)
+    for fn in ("f_stack_array", "f_heap_ptr", "f_getline"):
+        outs = [c for c in by_fn.get(fn, []) if c.get("via") == "out_buffer"]
+        assert outs, f"{fn}: expected an out_buffer chain, got {by_fn.get(fn)}"
+
+    # The negative control must NOT chain (source buffer != sink buffer).
+    assert not by_fn.get("f_no_chain"), (
+        f"false positive in f_no_chain: {by_fn.get('f_no_chain')}"
+    )
 
 
 def test_xrefs_by_name_unions_thunks(running_agent):
