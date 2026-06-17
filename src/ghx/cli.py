@@ -2129,11 +2129,16 @@ def cmd_evidence_xrefs(ns: argparse.Namespace) -> int:
     "evidence", "function",
     help="Function evidence: thunk, outgoing calls, IL volume, arg hints",
     fmt="json", target=True,
-    args=[arg("identifier", help="Function name or entry address")],
+    args=[
+        arg("identifier", help="Function name or entry address"),
+        arg("--context", type=int, default=0,
+            help="Disassembly instructions to include around each call (bn parity)"),
+    ],
 )
 def cmd_evidence_function(ns: argparse.Namespace) -> int:
     try:
-        response = _send("evidence_function", ns, identifier=ns.identifier)
+        response = _send("evidence_function", ns, identifier=ns.identifier,
+                         context=ns.context or None)
     except BridgeError as exc:
         print(f"ghx evidence function: {exc}", file=sys.stderr)
         return 1
@@ -2208,8 +2213,10 @@ def cmd_evidence_init(ns: argparse.Namespace) -> int:
     fmt="json", target=True,
     args=[
         arg("address", help="Table start address (hex 0x.. or symbol)"),
-        arg("-n", "--count", type=int, default=16,
-            help="Max pointer slots to read (default: 16)"),
+        arg("-n", "--count", "--entries", type=int, default=16, dest="count",
+            help="Max pointer slots to read (default: 16; --entries is the bn name)"),
+        arg("--stride", type=int, default=None,
+            help="Byte stride between entries (default: target pointer size)"),
         arg("--no-stop", action="store_true",
             help="Don't stop at the first unmapped slot"),
     ],
@@ -2217,7 +2224,8 @@ def cmd_evidence_init(ns: argparse.Namespace) -> int:
 def cmd_evidence_table(ns: argparse.Namespace) -> int:
     try:
         response = _send("evidence_table", ns, address=ns.address,
-                         count=ns.count, stop_on_unmapped=not ns.no_stop)
+                         count=ns.count, stride=ns.stride,
+                         stop_on_unmapped=not ns.no_stop)
     except BridgeError as exc:
         print(f"ghx evidence table: {exc}", file=sys.stderr)
         return 1

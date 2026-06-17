@@ -346,8 +346,13 @@ ghx extra).
 - [x] `target info --verbose` (`-v`) — adds the segment map (name/start/end/size/
   r-w-x perms/initialized), matching bn's `--verbose`. Verified on `/bin/ls`
   (33 segments).
-- [ ] `evidence {function,table,message}` — reconcile remaining flag diffs
-  (`--context`, `--entries`/`--stride`, `--table-entries`). Audit each against bn.
+- [~] `evidence {function,table,message}` — flag reconcile (audited vs bn 0.20.0).
+  Done: `evidence function --context N` (disasm around each call); `evidence
+  table --entries` (alias for `-n/--count`) + `--stride` (byte spacing, default
+  pointer size). Remaining: `evidence message --table-entries` (bn) — ghx's
+  message search instead exposes `--query/--regex/--limit` (richer); decide
+  whether `--table-entries` adds anything ghx lacks. ghx's `evidence table
+  --no-stop` is a ghx extra bn lacks (kept).
 - [x] `strings` value field now matches bn: `value` is the raw decoded string
   (`libc.so.6`), with Ghidra's C-literal kept as `repr` (`u8"libc.so.6"`) and the
   prefix split into `encoding`. Verified on `fw-A/bin-1` (`value='libc.so.6'

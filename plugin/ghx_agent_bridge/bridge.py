@@ -2372,6 +2372,7 @@ class GhxBridge:
         if identifier is None:
             raise OperationFailure("bad_request", "evidence_function requires 'identifier'")
         fn = _resolve_function(program, str(identifier))
+        context = int(params.get("context", 0))
         fm = program.getFunctionManager()
         rm = program.getReferenceManager()
         listing = program.getListing()
@@ -2386,14 +2387,19 @@ class GhxBridge:
                     continue
                 to = ref.getToAddress()
                 callee = fm.getFunctionAt(to) or fm.getFunctionContaining(to)
-                calls.append(
-                    {
-                        "call_addr": f"0x{int(ins.getAddress().getOffset()):x}",
-                        "target": str(callee.getName()) if callee is not None else None,
-                        "target_addr": f"0x{int(to.getOffset()):x}",
-                        "is_external": bool(callee.isExternal()) if callee is not None else None,
-                    }
-                )
+                call_entry: dict[str, Any] = {
+                    "call_addr": f"0x{int(ins.getAddress().getOffset()):x}",
+                    "target": str(callee.getName()) if callee is not None else None,
+                    "target_addr": f"0x{int(to.getOffset()):x}",
+                    "is_external": bool(callee.isExternal()) if callee is not None else None,
+                }
+                if context > 0:
+                    # bn's --context: disassembly around each call.
+                    call_entry["prev_ins"] = _surrounding_instructions(
+                        listing, ins, -context)
+                    call_entry["next_ins"] = _surrounding_instructions(
+                        listing, ins, context)
+                calls.append(call_entry)
 
         arg_hints = [
             {
@@ -2489,11 +2495,17 @@ class GhxBridge:
         addr_s = params.get("address")
         if addr_s is None:
             raise OperationFailure("bad_request", "evidence_table requires 'address'")
-        count = int(params.get("count", 16))
+        # `entries` is bn's name for the slot count; keep `count` as the alias.
+        count = int(params.get("entries") or params.get("count") or 16)
         if count <= 0 or count > 4096:
             raise OperationFailure("bad_request", "count must be in 1..4096")
         stop_on_unmapped = bool(params.get("stop_on_unmapped", True))
         ptr_size = int(params.get("pointer_size", program.getDefaultPointerSize()))
+        # `stride` is the byte spacing between entries (bn parity); defaults to
+        # the pointer size. The value at each slot is still read as a pointer.
+        stride = int(params.get("stride") or ptr_size)
+        if stride <= 0:
+            raise OperationFailure("bad_request", "stride must be positive")
 
         try:
             start = _parse_address(program, addr_s)
@@ -2506,7 +2518,7 @@ class GhxBridge:
 
         entries: list[dict[str, Any]] = []
         for i in range(count):
-            slot_off = start + i * ptr_size
+            slot_off = start + i * stride
             value = _read_pointer(program, slot_off, ptr_size)
             if value is None:
                 break
@@ -2519,6 +2531,7 @@ class GhxBridge:
         return {
             "address": f"0x{start:x}",
             "pointer_size": ptr_size,
+            "stride": stride,
             "count": len(entries),
             "function_slots": function_slots,
             "looks_like_vtable": function_slots >= 2 and function_slots >= len(entries) - 1,
