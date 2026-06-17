@@ -108,6 +108,31 @@ PROBES: dict[str, dict] = {
 }
 
 
+def _align(bn_set: set, ghx_set: set) -> tuple[set, int]:
+    """PIE binaries get different image bases in each engine (bn often 0x400000,
+    ghx 0x100000), so identical content compares as 0 shared. Detect the uniform
+    rebase delta that maximizes overlap and shift the ghx set onto bn's base.
+    Returns (aligned_ghx_set, delta). Only meaningful for int-keyed sets."""
+    if not bn_set or not ghx_set:
+        return ghx_set, 0
+    if not all(isinstance(x, int) for x in bn_set):
+        return ghx_set, 0
+    best_delta, best_overlap = 0, len(bn_set & ghx_set)
+    bn_lo = sorted(bn_set)[:6]
+    ghx_lo = sorted(ghx_set)[:6]
+    for b in bn_lo:
+        for g in ghx_lo:
+            d = b - g
+            if d == 0:
+                continue
+            overlap = len(bn_set & {x + d for x in ghx_set})
+            if overlap > best_overlap:
+                best_overlap, best_delta = overlap, d
+    if best_delta:
+        return {x + best_delta for x in ghx_set}, best_delta
+    return ghx_set, 0
+
+
 def _keyset(rows: list[dict], key: str) -> set:
     out = set()
     for r in rows:
@@ -194,9 +219,11 @@ def run_xrefs(bn_inst: str, ghx_inst: str | None) -> int:
     if not seeds:
         print("## xrefs: SKIP — no shared import seeds to compare\n")
         return 0
-    agree = 0
-    diverged: list[tuple] = []
-    bn_total = ghx_total = shared_total = 0
+    # Gather per-seed code-ref sets first, then detect one image-base delta from
+    # the global union (per-seed sets are too small to align reliably alone).
+    per_seed: list[tuple] = []
+    bn_union: set = set()
+    ghx_union: set = set()
     bn_data_refs = ghx_data_refs = 0
     for name in seeds:
         bn = _xrefs_addrs(_run_json(_bn_argv(["xrefs", name], bn_inst)), False)
@@ -204,18 +231,30 @@ def run_xrefs(bn_inst: str, ghx_inst: str | None) -> int:
         if bn is None or ghx is None:
             continue
         (bn_a, bn_d), (ghx_a, ghx_d) = bn, ghx
+        per_seed.append((name, bn_a, ghx_a))
+        bn_union |= bn_a
+        ghx_union |= ghx_a
+        bn_data_refs += bn_d
+        ghx_data_refs += ghx_d
+    _, delta = _align(bn_union, ghx_union)
+
+    agree = 0
+    diverged: list[tuple] = []
+    bn_total = ghx_total = shared_total = 0
+    for name, bn_a, ghx_a in per_seed:
+        if delta:
+            ghx_a = {x + delta for x in ghx_a}
         bn_total += len(bn_a)
         ghx_total += len(ghx_a)
         shared_total += len(bn_a & ghx_a)
-        bn_data_refs += bn_d
-        ghx_data_refs += ghx_d
         if bn_a == ghx_a:
             agree += 1
         else:
             diverged.append((name, bn_a - ghx_a, ghx_a - bn_a))
     tag = "AGREE" if not diverged else "DIVERGE"
+    rebased = f"  [rebased ghx by {delta:+#x}]" if delta else ""
     print(f"## xrefs: {tag}  ({agree}/{len(seeds)} seed names agree on callers; "
-          f"code-refs bn={bn_total} ghx={ghx_total} shared={shared_total})  key=address")
+          f"code-refs bn={bn_total} ghx={ghx_total} shared={shared_total}){rebased}  key=address")
     print(f"   note: data-refs (GOT/PLT slots, reported separately) "
           f"bn={bn_data_refs} ghx={ghx_data_refs}")
     for name, bn_only, ghx_only in diverged[:15]:
@@ -261,6 +300,8 @@ def run(binary: str, bn_inst: str, ghx_inst: str | None, probes: list[str]) -> i
         ghx_rows = _items(ghx_data, name)
         bn_set = _keyset(bn_rows, key)
         ghx_set = _keyset(ghx_rows, key)
+        # Align PIE image-base differences for address-keyed probes.
+        ghx_set, delta = _align(bn_set, ghx_set)
         both = bn_set & ghx_set
         bn_only = bn_set - ghx_set
         ghx_only = ghx_set - bn_set
@@ -269,8 +310,9 @@ def run(binary: str, bn_inst: str, ghx_inst: str | None, probes: list[str]) -> i
         tag = "AGREE" if agree else "DIVERGE"
         if not agree:
             diverged += 1
+        rebased = f"  [rebased ghx by {delta:+#x}]" if delta else ""
         print(f"## {name}: {tag}  (bn={len(bn_set)} ghx={len(ghx_set)} "
-              f"shared={len(both)})  key={key}")
+              f"shared={len(both)}){rebased}  key={key}")
         if bn_only:
             print(f"   bn-only ({len(bn_only)}): {_fmt_keys(bn_only, key)}")
         if ghx_only:

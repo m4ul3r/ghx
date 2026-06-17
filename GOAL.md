@@ -135,11 +135,17 @@ or a documented engine difference):
   1 each way — bn made a function at a lone `ret` Ghidra left as an undefined byte;
   ghx wrapped a lone `nop` in a `FUN_` bn ignored. Both are single-instruction
   CRT/padding stubs — a bidirectional engine heuristic, DOCUMENTED, not a bug.
-- [x] **imports (bn 28 / ghx 28 by name).** AGREE in a clean A/B. The earlier
-  `bn=30` (with `stderr`/`__stack_chk_guard`) did NOT reproduce in a freshly-loaded
-  isolated bn instance — it was an analysis-timing/state artifact of the prior bn
-  process, not a ghx gap. Lesson: A/B both engines from a clean load. (The raw
-  84-vs-59 count gap was always just thunk-row inflation; compare by unique name.)
+- [x] **imports — data symbols.** AGREE on bin-1 (28/28); the corpus run on
+  `/bin/ls` then exposed a REAL gap bin-1 didn't have: ghx's `getExternalSymbols()`
+  returns only function externals, MISSING imported DATA objects (`stderr`,
+  `stdout`, `optarg`, `optind`, `program_invocation_name/short_name`). Ghidra
+  models these as IMPORTED `Label`s in the synthetic EXTERNAL block. FIXED:
+  `imports` now also enumerates those (kind `data`), deduped by name; `--summary`
+  `by_kind` gained a `data` bucket. On `/bin/ls`: imports went from 6 bn-only
+  misses to **shared=118** (all bn imports matched). bin-1 is unchanged (it has no
+  imported data labels — so its earlier `bn=30` really was a bn artifact).
+  Residual ghx-only: `__progname`/`__progname_full` (data aliases bn omits) and
+  `default` (Ghidra's name for unresolved thunks — a naming quirk).
 - [x] **strings (bn 104 / ghx 125 → 100).** ghx scanned ELF METADATA blocks
   (`.shstrtab`/`.gnu_debuglink`/`_elfSectionHeaders` — overlay spaces where
   `isLoaded()==False`). FIXED: `strings` defaults to the loaded image only;
@@ -169,8 +175,17 @@ or a documented engine difference):
 - [ ] **decompiler/types.** Naming (`sub_` vs `FUN_`), inferred return types
   (`uint64_t` vs `void`), line counts (216 vs 139) differ — engine difference.
   Verify the same *logic* is recovered, document rather than force byte-equality.
-- [ ] **Run on a corpus, not one 13KB binary.** Multiple arches/sizes. The harness
-  is generic (`tools/ab_parity.py <binary>`); only the dogfood target has been run.
+- [~] **Run on a corpus, not one 13KB binary.** Started: ran the harness on
+  `/bin/ls` (x86-64, PIE, 142KB) alongside `fw-A/bin-1` (AArch64, non-PIE, 13KB).
+  This surfaced two things: (1) the imports data-symbol gap (now fixed, above) —
+  the corpus did its job; (2) a harness blind spot — PIE binaries get different
+  image bases per engine (bn 0x400000 / ghx 0x100000), so address sets compared
+  as 0 shared. FIXED: `_align()` auto-detects the uniform rebase delta and shifts
+  ghx onto bn's base (reported as `[rebased ghx by +0x300000]`). Post-fix `/bin/ls`:
+  functions shared 293 (bn lists ~104 more `.plt`-stub functions — engine
+  modeling), strings shared 459 (bn defines ~560 more — bn's string analysis is
+  more aggressive; documented engine difference), xrefs 26/30 caller seeds agree.
+  Still TODO: more arches/sizes, and quantify the strings analysis-depth gap.
 
 ## Backlog (prioritized, grounded in the dogfood friction log + option diff)
 
@@ -376,6 +391,18 @@ already loaded speeds the loop. Keep all captured artifacts under `.dogfood/`.
 
 ## Progress ledger (append one line per cycle — newest first)
 
+- 2026-06-17 — **Corpus validation + imports data-symbol fix.** Ran the A/B
+  harness on `/bin/ls` (x86-64 PIE) beside bin-1 (AArch64). It surfaced a REAL
+  gap bin-1 lacked: `imports` missed imported DATA objects (stderr/stdout/optarg/
+  …) — Ghidra keeps them as IMPORTED Labels in the EXTERNAL block, not in
+  getExternalSymbols(). Fixed `imports` to enumerate them (kind `data`); `/bin/ls`
+  imports now `shared=118` (was 6 bn-only misses). Also fixed the harness for PIE:
+  `_align()` auto-detects the per-engine image-base delta and rebases ghx onto
+  bn's base, so address probes are meaningful (functions 293 shared, strings 459
+  shared, xrefs 26/30 after rebase). Remaining `/bin/ls` divergences are engine
+  differences: bn enumerates ~104 more .plt-stub functions, defines ~560 more
+  strings. `strings` value also now returns bn's raw decoded form (repr/encoding
+  kept). 184 unit green.
 - 2026-06-17 — **VR-core: interprocedural forward taint.** `taint forward
   --interprocedural [--ip-depth N]` follows a sink arg that derives from a
   parameter UP the call graph (mapping param→actual-arg at each caller) to a

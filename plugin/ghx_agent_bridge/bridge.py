@@ -1340,6 +1340,7 @@ class GhxBridge:
                     "address": f"0x{off:x}",
                     "library": library,
                     "is_thunk": False,
+                    "kind": "external",
                 }
             )
 
@@ -1361,23 +1362,62 @@ class GhxBridge:
                         else None
                     ),
                     "is_thunk": True,
+                    "kind": "thunk",
                 }
             )
+
+        # Imported DATA/object symbols (stderr, stdout, optarg, ...) are not
+        # returned by getExternalSymbols() — Ghidra models them as IMPORTED
+        # Labels in the synthetic EXTERNAL block. bn lists them as imports, so
+        # surface them too (deduped by name against the function externals).
+        seen_names = {r["name"] for r in rows}
+        ext_block = next(
+            (b for b in program.getMemory().getBlocks()
+             if str(b.getName()) == _EXTERNAL_BLOCK_NAME),
+            None,
+        )
+        if ext_block is not None:
+            from ghidra.program.model.address import AddressSet  # type: ignore
+            from ghidra.program.model.symbol import SymbolType  # type: ignore
+
+            st = program.getSymbolTable()
+            fm = program.getFunctionManager()
+            aset = AddressSet(ext_block.getStart(), ext_block.getEnd())
+            it = st.getSymbols(aset, SymbolType.LABEL, True)
+            while it.hasNext():
+                sym = it.next()
+                if str(sym.getSource()) != "IMPORTED":
+                    continue
+                addr = sym.getAddress()
+                if addr is None or fm.getFunctionContaining(addr) is not None:
+                    continue  # a function external, already covered
+                name = str(sym.getName())
+                if name in seen_names:
+                    continue
+                seen_names.add(name)
+                rows.append(
+                    {
+                        "name": name,
+                        "address": f"0x{int(addr.getOffset()):x}",
+                        "library": None,
+                        "is_thunk": False,
+                        "kind": "data",
+                    }
+                )
+
         rows.sort(key=lambda row: (row["name"], int(row["address"], 16)))
 
         if params.get("summary"):
             by_library: dict[str, int] = {}
-            thunk = external = 0
+            by_kind: dict[str, int] = {}
             for r in rows:
                 lib = r.get("library") or "(none)"
                 by_library[lib] = by_library.get(lib, 0) + 1
-                if r["is_thunk"]:
-                    thunk += 1
-                else:
-                    external += 1
+                k = r.get("kind", "external")
+                by_kind[k] = by_kind.get(k, 0) + 1
             return {
                 "total": len(rows),
-                "by_kind": {"external": external, "thunk": thunk},
+                "by_kind": by_kind,
                 "by_library": dict(
                     sorted(by_library.items(), key=lambda kv: (-kv[1], kv[0]))
                 ),
