@@ -8,7 +8,9 @@ import pytest
 
 from ghx.output import (
     DEFAULT_SPILL_TOKEN_LIMIT,
+    OutputWriteError,
     render_value,
+    write_bytes_result,
     write_output_result,
 )
 
@@ -69,6 +71,27 @@ def test_write_output_result_spills_when_over_budget(tmp_cache):
     assert "sha256:" in r.rendered
 
 
+def test_write_output_result_spill_paths_are_unique(tmp_cache):
+    big = "x " * 50_000
+    first = write_output_result(
+        big,
+        fmt="text",
+        out_path=None,
+        stem="unit",
+        spill_token_limit=100,
+    )
+    second = write_output_result(
+        big,
+        fmt="text",
+        out_path=None,
+        stem="unit",
+        spill_token_limit=100,
+    )
+    assert first.artifact is not None
+    assert second.artifact is not None
+    assert first.artifact["artifact_path"] != second.artifact["artifact_path"]
+
+
 def test_write_output_result_explicit_out_path(tmp_path):
     dest = tmp_path / "result.json"
     r = write_output_result(
@@ -82,6 +105,28 @@ def test_write_output_result_explicit_out_path(tmp_path):
     # Explicit --out never marks as "spilled" even though the content moved to disk.
     assert r.artifact["spilled"] is False
     assert r.artifact["artifact_path"] == str(dest)
+
+
+def test_write_output_result_explicit_out_path_errors(tmp_path):
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    with pytest.raises(OutputWriteError):
+        write_output_result(
+            "data",
+            fmt="text",
+            out_path=blocker / "result.txt",
+            stem="unit",
+        )
+
+
+def test_write_bytes_result_explicit_out_path(tmp_path):
+    dest = tmp_path / "bytes.bin"
+    r = write_bytes_result(b"\x00ABC", out_path=dest)
+    assert dest.read_bytes() == b"\x00ABC"
+    assert r.artifact is not None
+    assert r.artifact["format"] == "bytes"
+    assert r.artifact["bytes"] == 4
+    assert "path:" in r.rendered
 
 
 def test_default_spill_token_limit_stable():

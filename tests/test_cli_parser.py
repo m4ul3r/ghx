@@ -38,8 +38,11 @@ def test_version_is_exposed(parser, capsys):
         ["instance", "prune"],
         ["instance", "prune", "--idle", "300"],
         ["instance", "list"],
+        ["-t", "active", "doctor"],
+        ["-t", "active", "function", "info", "main"],
         ["load", "/bin/ls"],
         ["load", "/bin/ls", "--quick"],
+        ["load", "/bin/ls", "--no-gzf"],
         ["close"],
         ["close", "--all"],
         ["target", "list"],
@@ -124,6 +127,7 @@ def test_version_is_exposed(parser, capsys):
         ["callsites", "memcpy", "--caller-static"],
         ["bundle", "function", "main"],
         ["batch", "apply", "/tmp/manifest.json"],
+        ["batch", "apply", "-"],
         ["py", "exec", "--code", "print(1)"],
         ["py", "exec", "--code", "x=1", "--mutate"],
         ["py", "exec", "--stdin"],
@@ -199,7 +203,8 @@ def test_common_flags_on_target_command(parser):
     assert ns.target == "active"
 
 
-def test_doctor_rejects_target_flag(parser):
-    # Doctor is not a target-aware command; -t should fail to parse.
+def test_non_target_command_rejects_post_command_target_flag(parser):
+    # Root -t is global, but non-target commands still do not accept a
+    # command-local -t after the subcommand name.
     with pytest.raises(SystemExit):
         parser.parse_args(["doctor", "-t", "active"])

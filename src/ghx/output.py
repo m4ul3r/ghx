@@ -3,6 +3,9 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import os
+import secrets
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,9 +28,15 @@ class OutputWriteResult:
     spilled: bool = False
 
 
+class OutputWriteError(RuntimeError):
+    """Raised when an explicit user-requested output path cannot be written."""
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
+    if isinstance(value, bytes | bytearray):
+        return value.hex()
     return repr(value)
 
 
@@ -55,6 +64,8 @@ def _summary(value: Any) -> dict[str, Any]:
         return {"kind": "array", "count": len(value)}
     if isinstance(value, str):
         return {"kind": "string", "chars": len(value)}
+    if isinstance(value, bytes | bytearray):
+        return {"kind": "bytes", "bytes": len(value)}
     return {"kind": type(value).__name__}
 
 
@@ -62,7 +73,21 @@ def _spill_path(stem: str, suffix: str) -> Path:
     now = datetime.now(timezone.utc)
     directory = spill_root() / now.strftime("%Y%m%d")
     directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"{stem}-{now.strftime('%H%M%S')}{suffix}"
+    unique = f"{os.getpid()}-{secrets.token_hex(4)}"
+    return directory / f"{stem}-{now.strftime('%H%M%S')}-{unique}{suffix}"
+
+
+def _write_artifact(path: Path, encoded: bytes, *, explicit: bool) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(encoded)
+        return True
+    except OSError as exc:
+        message = f"could not write output artifact {path}: {exc}"
+        if explicit:
+            raise OutputWriteError(message) from exc
+        print(f"ghx output: {message}; emitting inline output instead", file=sys.stderr)
+        return False
 
 
 @functools.cache
@@ -139,8 +164,7 @@ def write_output_result(
     token_count = len(_token_encoding().encode(rendered))
 
     if out_path is not None:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(encoded)
+        _write_artifact(out_path, encoded, explicit=True)
         artifact = _artifact_payload(
             artifact_path=out_path,
             fmt=fmt,
@@ -160,7 +184,8 @@ def write_output_result(
 
     suffix = ".ndjson" if fmt == "ndjson" else ".txt" if fmt == "text" else ".json"
     spill_path = _spill_path(stem, suffix)
-    spill_path.write_bytes(encoded)
+    if not _write_artifact(spill_path, encoded, explicit=False):
+        return OutputWriteResult(rendered=rendered)
     artifact = _artifact_payload(
         artifact_path=spill_path,
         fmt=fmt,
@@ -173,6 +198,29 @@ def write_output_result(
         rendered=render_artifact_envelope(artifact),
         artifact=artifact,
         spilled=True,
+    )
+
+
+def write_bytes_result(
+    data: bytes,
+    *,
+    out_path: Path,
+) -> OutputWriteResult:
+    """Write raw bytes to an explicit path and return the usual artifact envelope."""
+
+    _write_artifact(out_path, data, explicit=True)
+    artifact = _artifact_payload(
+        artifact_path=out_path,
+        fmt="bytes",
+        encoded=data,
+        token_count=0,
+        value=data,
+        spilled=False,
+    )
+    return OutputWriteResult(
+        rendered=render_artifact_envelope(artifact),
+        artifact=artifact,
+        spilled=False,
     )
 
 

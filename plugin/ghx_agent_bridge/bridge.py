@@ -153,6 +153,21 @@ WRITE_LOCKED_OPS: set[str] = {
     "batch_apply",
 }
 
+DIRTY_ON_COMMIT_OPS: set[str] = {
+    "create_function",
+    "rename_symbol",
+    "set_comment",
+    "delete_comment",
+    "set_prototype",
+    "local_rename",
+    "local_retype",
+    "types_declare",
+    "struct_field_set",
+    "struct_field_rename",
+    "struct_field_delete",
+    "batch_apply",
+}
+
 
 # ---------------------------------------------------------------------------
 # Target management
@@ -168,6 +183,9 @@ class ProgramHandle:
     opened_at: str
     program: Any = field(repr=False)
     consumer: Any = field(repr=False)
+    loaded_from: str = ""
+    loaded_from_saved: bool = False
+    dirty: bool = False
 
     def describe(self, verbose: bool = False) -> dict[str, Any]:
         prog = self.program
@@ -187,8 +205,11 @@ class ProgramHandle:
             "program_id": self.program_id,
             "basename": self.basename,
             "filename": self.filename,
+            "loaded_from": self.loaded_from,
+            "loaded_from_saved": self.loaded_from_saved,
             "domain_file_path": self.domain_file_path,
             "opened_at": self.opened_at,
+            "dirty": self.dirty,
             "language": language,
             "arch": arch,
             "compiler": compiler,
@@ -220,6 +241,29 @@ class ProgramHandle:
         return info
 
 
+def _gzf_sidecar_candidates(src: Path) -> list[Path]:
+    if src.suffix.lower() == ".gzf":
+        return []
+    candidates = [src.parent / f"{src.name}.gzf"]
+    if src.suffix:
+        candidates.append(src.with_suffix(".gzf"))
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            unique.append(candidate)
+    return unique
+
+
+def _select_load_source(requested: Path, *, prefer_gzf: bool) -> tuple[Path, bool]:
+    if prefer_gzf:
+        for candidate in _gzf_sidecar_candidates(requested):
+            if candidate.exists():
+                return candidate, True
+    return requested, requested.suffix.lower() == ".gzf"
+
+
 class TargetManager:
     def __init__(self, project: Any) -> None:
         self.project = project
@@ -229,14 +273,15 @@ class TargetManager:
 
     # ---- lifecycle ------------------------------------------------------
 
-    def load_binary(self, path: str, quick: bool = False) -> ProgramHandle:
+    def load_binary(self, path: str, quick: bool = False, prefer_gzf: bool = True) -> ProgramHandle:
         import pyghidra
         from java.io import File  # type: ignore
         from java.lang import Object  # type: ignore
 
-        src = Path(path).expanduser().resolve()
+        requested_src = Path(path).expanduser().resolve()
+        src, loaded_from_saved = _select_load_source(requested_src, prefer_gzf=prefer_gzf)
         if not src.exists():
-            raise OperationFailure("not_found", f"binary not found: {src}")
+            raise OperationFailure("not_found", f"binary not found: {requested_src}")
 
         consumer = Object()
         monitor = pyghidra.task_monitor()
@@ -256,7 +301,7 @@ class TargetManager:
             ) from exc
 
         program = None
-        domain_path = f"/{src.name}"
+        domain_path = f"/{requested_src.name}"
         try:
             primary = load_results.getPrimary()
             try:
@@ -293,8 +338,10 @@ class TargetManager:
         program_id = secrets.token_hex(4)
         handle = ProgramHandle(
             program_id=program_id,
-            basename=src.name,
-            filename=str(src),
+            basename=requested_src.name,
+            filename=str(requested_src),
+            loaded_from=str(src),
+            loaded_from_saved=loaded_from_saved,
             domain_file_path=domain_path,
             opened_at=datetime.now(timezone.utc).isoformat(),
             program=program,
@@ -308,13 +355,14 @@ class TargetManager:
     def close(self, selector: str | None) -> dict[str, Any]:
         handle = self.resolve(selector, required=True)
         assert handle is not None
+        unsaved = bool(handle.dirty)
         with self._lock:
             self._handles.pop(handle.program_id, None)
             if self._active == handle.program_id:
                 self._active = next(iter(self._handles), None)
         with contextlib.suppress(Exception):
             handle.program.release(handle.consumer)
-        return {"program_id": handle.program_id, "closed": True}
+        return {"program_id": handle.program_id, "closed": True, "unsaved": unsaved}
 
     def close_all(self) -> dict[str, Any]:
         """Release every loaded program. Used both by the `close --all` op and
@@ -324,11 +372,14 @@ class TargetManager:
             self._handles.clear()
             self._active = None
         closed: list[str] = []
+        unsaved: list[str] = []
         for h in handles:
             with contextlib.suppress(Exception):
                 h.program.release(h.consumer)
             closed.append(h.program_id)
-        return {"closed": closed, "count": len(closed)}
+            if h.dirty:
+                unsaved.append(h.program_id)
+        return {"closed": closed, "count": len(closed), "unsaved": unsaved}
 
     # ---- resolution -----------------------------------------------------
 
@@ -372,6 +423,19 @@ class TargetManager:
         with self._lock:
             if program_id in self._handles:
                 self._active = program_id
+
+    def mark_dirty_for_program(self, program: Any) -> None:
+        with self._lock:
+            for handle in self._handles.values():
+                if handle.program is program:
+                    handle.dirty = True
+                    return
+
+    def mark_clean(self, program_id: str) -> None:
+        with self._lock:
+            handle = self._handles.get(program_id)
+            if handle is not None:
+                handle.dirty = False
 
     def list(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -568,6 +632,7 @@ class GhxBridge:
                 lock = self._target_lock.read()
             with lock:
                 result = self._run_op(op, params, target)
+                self._mark_dirty_if_committed(op, params, target, result)
             return _json_response(ok=True, result=result)
         except OperationFailure as exc:
             return _json_response(
@@ -584,6 +649,21 @@ class GhxBridge:
             tb = traceback.format_exc()
             print(tb, file=sys.stderr, flush=True)
             return _json_response(ok=False, error=f"{type(exc).__name__}: {exc}")
+
+    def _mark_dirty_if_committed(
+        self,
+        op: str | None,
+        params: dict[str, Any],
+        target: str | None,
+        result: Any,
+    ) -> None:
+        if op not in DIRTY_ON_COMMIT_OPS:
+            return
+        if not isinstance(result, dict) or not result.get("committed"):
+            return
+        handle = self.targets.resolve(params.get("target") or target, required=False)
+        if handle is not None:
+            self.targets.mark_dirty_for_program(handle.program)
 
     def _run_op(self, op: str | None, params: dict[str, Any], target: str | None) -> Any:
         if op == "doctor":
@@ -602,7 +682,8 @@ class GhxBridge:
             if not path:
                 raise OperationFailure("bad_request", "load_binary requires 'path'")
             quick = bool(params.get("quick", False))
-            handle = self.targets.load_binary(str(path), quick=quick)
+            prefer_gzf = bool(params.get("prefer_gzf", True))
+            handle = self.targets.load_binary(str(path), quick=quick, prefer_gzf=prefer_gzf)
             return {"loaded": True, "analyzed": not quick, **handle.describe()}
         if op == "close_binary":
             if params.get("all"):
@@ -1297,7 +1378,7 @@ class GhxBridge:
                 try:
                     pattern = re.compile(str(query), re.IGNORECASE)
                 except re.error as exc:
-                    raise ValueError(f"invalid --regex pattern: {exc}")
+                    raise OperationFailure("invalid_regex", f"invalid regex: {exc}") from exc
             else:
                 needle = str(query).lower()
         section_filter = params.get("section")
@@ -3556,6 +3637,7 @@ class GhxBridge:
                 with contextlib.suppress(Exception):
                     detail = str(exporter.getMessageLog())
                 raise OperationFailure("export_failed", f"gzf export failed: {detail}".strip())
+            self.targets.mark_clean(handle.program_id)
             return {
                 "saved": True,
                 "exported": True,
@@ -3581,6 +3663,7 @@ class GhxBridge:
             raise OperationFailure(
                 "save_failed", f"save failed: {exc}",
             ) from exc
+        self.targets.mark_clean(handle.program_id)
         return {
             "saved": True,
             "program_id": handle.program_id,

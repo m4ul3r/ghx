@@ -120,6 +120,23 @@ def test_choose_instance_raises_when_missing(tmp_cache):
         transport.choose_instance("does-not-exist", auto_start=False)
 
 
+def test_choose_instance_rejects_unsafe_instance_id(tmp_cache):
+    with pytest.raises(transport.BridgeError):
+        transport.choose_instance("../bad", auto_start=False)
+
+
+def test_choose_instance_can_spawn_missing_named_instance(tmp_cache, monkeypatch):
+    monkeypatch.setattr(transport, "list_instances", lambda: [])
+    monkeypatch.setattr(
+        transport,
+        "spawn_instance",
+        lambda instance_id=None, **_: _fake_instance(instance_id or "generated"),
+    )
+
+    inst = transport.choose_instance("named1", spawn_missing_named=True)
+    assert inst.instance_id == "named1"
+
+
 def test_choose_instance_honours_pin(tmp_cache, monkeypatch):
     insts = [_fake_instance("aaaa"), _fake_instance("bbbb")]
     monkeypatch.setattr(transport, "list_instances", lambda: insts)
@@ -195,3 +212,16 @@ def test_purges_stale_registry_when_socket_missing(tmp_cache):
     assert transport.list_instances() == []
     # list_instances purges the stale registry.
     assert not reg.exists()
+
+
+def test_purges_stale_managed_socket_with_registry(tmp_cache):
+    sock_path = paths.bridge_socket_path("stale")
+    sock_path.parent.mkdir(parents=True, exist_ok=True)
+    sock_path.write_text("not a socket")
+    reg = _write_registry(tmp_cache, "stale", sock_path, pid=os.getpid())
+    assert reg.exists()
+    assert sock_path.exists()
+
+    assert transport.list_instances() == []
+    assert not reg.exists()
+    assert not sock_path.exists()

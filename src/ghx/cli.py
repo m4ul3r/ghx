@@ -19,7 +19,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import pins
-from .output import DEFAULT_SPILL_TOKEN_LIMIT, write_output_result
+from .output import (
+    DEFAULT_SPILL_TOKEN_LIMIT,
+    OutputWriteError,
+    write_bytes_result,
+    write_output_result,
+)
 from .paths import (
     bridge_registry_path,
     claude_skills_dir,
@@ -127,11 +132,11 @@ def _instance_option(parser: argparse.ArgumentParser, *, is_root: bool = False) 
     )
 
 
-def _target_option(parser: argparse.ArgumentParser) -> None:
+def _target_option(parser: argparse.ArgumentParser, *, is_root: bool = False) -> None:
     parser.add_argument(
         "-t",
         "--target",
-        default=None,
+        default=None if is_root else argparse.SUPPRESS,
         help="Target program selector (program_id, basename, filename, or 'active')",
     )
 
@@ -760,6 +765,8 @@ def cmd_session_restart(ns: argparse.Namespace) -> int:
             help="Request timeout in seconds (default: 120; first-load analysis can be slow)"),
         arg("--quick", action="store_true",
             help="Import without auto-analysis (fast); deepen later with `ghx refresh`"),
+        arg("--no-gzf", action="store_true",
+            help="Do not prefer a sibling .gzf saved analysis archive when present"),
     ],
 )
 def cmd_load(ns: argparse.Namespace) -> int:
@@ -770,9 +777,14 @@ def cmd_load(ns: argparse.Namespace) -> int:
     try:
         response = send_request(
             "load_binary",
-            params={"path": str(path), "quick": ns.quick},
+            params={
+                "path": str(path),
+                "quick": ns.quick,
+                "prefer_gzf": not ns.no_gzf,
+            },
             instance_id=ns.instance,
             timeout=ns.timeout,
+            spawn_missing_named=True,
         )
     except BridgeError as exc:
         print(f"ghx load: {exc}", file=sys.stderr)
@@ -780,9 +792,10 @@ def cmd_load(ns: argparse.Namespace) -> int:
 
     def _render(p, out):
         tag = "" if p.get("analyzed", True) else "  (quick: not analyzed — run `ghx refresh`)"
+        source = "  (loaded saved GZF)" if p.get("loaded_from_saved") else ""
         out.write(
             f"loaded  {p.get('basename')}  id={p.get('program_id')}  "
-            f"[{p.get('language')}]  size={p.get('size')}{tag}\n"
+            f"[{p.get('language')}]  size={p.get('size')}{tag}{source}\n"
         )
 
     _emit(response["result"], ns, text_renderer=_render)
@@ -806,8 +819,12 @@ def cmd_close(ns: argparse.Namespace) -> int:
         if isinstance(p.get("closed"), list):
             ids = ", ".join(p["closed"]) or "(none)"
             out.write(f"closed  {p.get('count', len(p['closed']))} program(s): {ids}\n")
+            unsaved = p.get("unsaved") or []
+            if unsaved:
+                out.write(f"WARN unsaved changes were closed: {', '.join(unsaved)}\n")
         else:
-            out.write(f"closed  {p.get('program_id')}\n")
+            suffix = "  (unsaved changes were not saved)" if p.get("unsaved") else ""
+            out.write(f"closed  {p.get('program_id')}{suffix}\n")
 
     _emit(response["result"], ns, text_renderer=_render)
     return 0
@@ -1328,8 +1345,8 @@ def cmd_read(ns: argparse.Namespace) -> int:
         data = bytes.fromhex(result.get("bytes_hex", "") or "")
         out_path = _resolve_out(ns)
         if out_path:
-            Path(out_path).expanduser().write_bytes(data)
-            print(f"wrote {len(data)} bytes to {out_path}")
+            written = write_bytes_result(data, out_path=out_path)
+            sys.stdout.write(written.rendered)
         else:
             sys.stdout.buffer.write(data)
         return 0
@@ -2713,19 +2730,21 @@ def cmd_struct_field_delete(ns: argparse.Namespace) -> int:
     ],
 )
 def cmd_batch_apply(ns: argparse.Namespace) -> int:
-    path = Path(ns.manifest).expanduser()
     try:
-        manifest = json.loads(path.read_text())
+        raw = sys.stdin.read() if ns.manifest == "-" else Path(ns.manifest).expanduser().read_text()
+        manifest = json.loads(raw)
     except Exception as exc:
         print(f"ghx batch apply: could not read manifest: {exc}", file=sys.stderr)
         return 2
     if isinstance(manifest, list):
         operations = manifest
+    elif isinstance(manifest, dict) and isinstance(manifest.get("ops"), list):
+        operations = manifest["ops"]
     elif isinstance(manifest, dict) and isinstance(manifest.get("operations"), list):
         operations = manifest["operations"]
     else:
         print("ghx batch apply: manifest must be a list of operations or "
-              "an object with 'operations': [...]", file=sys.stderr)
+              "an object with 'ops': [...] or 'operations': [...]", file=sys.stderr)
         return 2
     try:
         response = _send(
@@ -2819,6 +2838,7 @@ def build_parser() -> GhxArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"ghx {VERSION}")
     _instance_option(parser, is_root=True)
+    _target_option(parser, is_root=True)
     _build_from_commands(parser)
     return parser
 
@@ -2839,6 +2859,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         return handler(ns)
+    except OutputWriteError as exc:
+        print(f"ghx: {exc}", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         return 130
 

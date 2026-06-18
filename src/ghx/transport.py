@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import fcntl
 import json
 import os
+import re
 import secrets
 import socket
 import subprocess
@@ -26,6 +28,8 @@ TRANSIENT_SOCKET_ERRNOS = {
     errno.ECONNREFUSED,
     errno.ENOENT,
 }
+
+INSTANCE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
 
 @dataclass(slots=True)
@@ -55,9 +59,36 @@ def _format_instance_choices(instances: list[BridgeInstance]) -> str:
     return "\n".join(lines)
 
 
+def _validate_instance_id(instance_id: str) -> None:
+    if not INSTANCE_ID_RE.fullmatch(instance_id):
+        raise BridgeError(
+            "Invalid ghx instance id; use 1-64 letters, digits, dots, dashes, or underscores, "
+            "starting with a letter or digit"
+        )
+
+
+def _is_managed_socket_path(path: Path) -> bool:
+    try:
+        return path.resolve().parent == instances_dir().resolve()
+    except OSError:
+        return False
+
+
 def _purge_stale_registry(registry_path: Path) -> None:
+    socket_path: Path | None = None
+    try:
+        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+        socket_value = payload.get("socket_path")
+        if socket_value:
+            socket_path = Path(str(socket_value))
+    except (OSError, json.JSONDecodeError, AttributeError):
+        socket_path = None
+
     with contextlib.suppress(OSError):
         registry_path.unlink()
+    if socket_path is not None and _is_managed_socket_path(socket_path):
+        with contextlib.suppress(OSError):
+            socket_path.unlink()
 
 
 def _socket_is_live(socket_path: Path, timeout: float = 0.2) -> bool:
@@ -119,12 +150,20 @@ def list_instances() -> list[BridgeInstance]:
     return instances
 
 
-def choose_instance(instance_id: str | None = None, *, auto_start: bool = True) -> BridgeInstance:
+def choose_instance(
+    instance_id: str | None = None,
+    *,
+    auto_start: bool = True,
+    spawn_missing_named: bool = False,
+) -> BridgeInstance:
     instances = list_instances()
     if instance_id is not None:
+        _validate_instance_id(instance_id)
         for inst in instances:
             if inst.instance_id == instance_id or instance_selector(inst) == instance_id:
                 return inst
+        if auto_start and spawn_missing_named:
+            return spawn_instance(instance_id=instance_id)
         raise BridgeError(f"No ghx bridge instance found with id: {instance_id}")
     # No explicit selection: honour a sticky pin if it points at a live
     # instance. A stale/absent pin falls through to normal resolution.
@@ -199,8 +238,27 @@ def _send_request_to_instance(
             f"Failed to contact ghx bridge pid {instance.pid} at {instance.socket_path}: {last_error}"
         ) from last_error
 
+    if last_error is not None and chunks:
+        raise BridgeError(
+            f"Connection to ghx bridge pid {instance.pid} at {instance.socket_path} "
+            f"failed mid-response: {last_error}"
+        ) from last_error
+
     if not chunks:
-        raise BridgeError("ghx bridge returned an empty response")
+        alive = False
+        try:
+            os.kill(instance.pid, 0)
+            alive = True
+        except OSError:
+            alive = False
+        log_hint = ""
+        if instance.instance_id:
+            log_hint = _spawn_failure_detail(instances_dir() / f"{instance.instance_id}.log")
+        state = "still running" if alive else "not running"
+        raise BridgeError(
+            f"ghx bridge pid {instance.pid} at {instance.socket_path} returned an empty "
+            f"response (process {state}).{log_hint}"
+        )
 
     try:
         response = json.loads(b"".join(chunks).decode("utf-8"))
@@ -271,6 +329,33 @@ def _find_ghx_agent() -> list[str]:
     return [sys.executable, "-m", "ghx.headless"]
 
 
+@contextlib.contextmanager
+def _spawn_lock():
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = inst_dir / ".spawn.lock"
+    with open(lock_path, "a+") as lock_file:  # noqa: SIM115
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _terminate_spawned(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        proc.terminate()
+    try:
+        proc.wait(timeout=3.0)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=2.0)
+
+
 def spawn_instance(
     instance_id: str | None = None,
     *,
@@ -283,57 +368,61 @@ def spawn_instance(
     JVM cold-start for PyGhidra typically takes 4-8s; the 45s default gives
     auto-analysis headroom on first boot.
     """
-    existing = list_instances()
-    if instance_id is None:
-        existing_selectors = {instance_selector(inst) for inst in existing}
-        while True:
-            candidate = secrets.token_hex(4)
-            if candidate not in existing_selectors:
-                instance_id = candidate
-                break
-    elif instance_id == "default":
-        raise BridgeError("Instance id 'default' is reserved")
-    elif any(inst.instance_id == instance_id or instance_selector(inst) == instance_id for inst in existing):
-        raise BridgeError(f"Bridge instance already exists with id: {instance_id}")
+    with _spawn_lock():
+        existing = list_instances()
+        if instance_id is None:
+            existing_selectors = {instance_selector(inst) for inst in existing}
+            while True:
+                candidate = secrets.token_hex(4)
+                if candidate not in existing_selectors:
+                    instance_id = candidate
+                    break
+        else:
+            _validate_instance_id(instance_id)
+            if instance_id == "default":
+                raise BridgeError("Instance id 'default' is reserved")
+            if any(inst.instance_id == instance_id or instance_selector(inst) == instance_id for inst in existing):
+                raise BridgeError(f"Bridge instance already exists with id: {instance_id}")
 
-    inst_dir = instances_dir()
-    inst_dir.mkdir(parents=True, exist_ok=True)
+        inst_dir = instances_dir()
+        inst_dir.mkdir(parents=True, exist_ok=True)
 
-    log_path = inst_dir / f"{instance_id}.log"
-    log_file = open(log_path, "w")  # noqa: SIM115
+        log_path = inst_dir / f"{instance_id}.log"
+        log_file = open(log_path, "w")  # noqa: SIM115
 
-    cmd = _find_ghx_agent() + ["--instance-id", instance_id]
-    if extra_args:
-        cmd = cmd + list(extra_args)
-    proc = subprocess.Popen(
-        cmd,
-        start_new_session=True,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-    )
-    log_file.close()
+        cmd = _find_ghx_agent() + ["--instance-id", instance_id]
+        if extra_args:
+            cmd = cmd + list(extra_args)
+        proc = subprocess.Popen(
+            cmd,
+            start_new_session=True,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        log_file.close()
 
-    reg_path = bridge_registry_path(instance_id)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if reg_path.exists():
-            inst = _load_instance(reg_path)
-            if inst is not None:
-                return inst
-        if proc.poll() is not None:
-            raise BridgeError(
-                f"ghx-agent (pid {proc.pid}, instance {instance_id}) exited "
-                f"with code {proc.returncode} before registering."
-                f"{_spawn_failure_detail(log_path)}"
-            )
-        time.sleep(poll_interval)
+        reg_path = bridge_registry_path(instance_id)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if reg_path.exists():
+                inst = _load_instance(reg_path)
+                if inst is not None:
+                    return inst
+            if proc.poll() is not None:
+                raise BridgeError(
+                    f"ghx-agent (pid {proc.pid}, instance {instance_id}) exited "
+                    f"with code {proc.returncode} before registering."
+                    f"{_spawn_failure_detail(log_path)}"
+                )
+            time.sleep(poll_interval)
 
-    raise BridgeError(
-        f"Auto-started ghx-agent (pid {proc.pid}, instance {instance_id}) "
-        f"did not register within {timeout:.0f}s."
-        f"{_spawn_failure_detail(log_path)}"
-    )
+        _terminate_spawned(proc)
+        raise BridgeError(
+            f"Auto-started ghx-agent (pid {proc.pid}, instance {instance_id}) "
+            f"did not register within {timeout:.0f}s."
+            f"{_spawn_failure_detail(log_path)}"
+        )
 
 
 def send_request(
@@ -344,8 +433,9 @@ def send_request(
     timeout: float | None = None,
     connect_retries: int = 4,
     instance_id: str | None = None,
+    spawn_missing_named: bool = False,
 ) -> dict[str, Any]:
-    instance = choose_instance(instance_id)
+    instance = choose_instance(instance_id, spawn_missing_named=spawn_missing_named)
     return _send_request_to_instance(
         instance,
         op,
