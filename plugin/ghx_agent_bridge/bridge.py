@@ -361,7 +361,7 @@ class TargetManager:
             if len(matches) > 1:
                 raise OperationFailure(
                     "ambiguous_target",
-                    f"selector '{selector}' matches {len(matches)} targets",
+                    _ambiguous_target_message(str(selector), matches),
                 )
 
         if required:
@@ -381,6 +381,25 @@ class TargetManager:
             {**h.describe(), "active": h.program_id == active}
             for h in handles
         ]
+
+
+def _target_selector_summary(handle: ProgramHandle) -> str:
+    selectors = [
+        f"id={handle.program_id}",
+        f"basename={handle.basename!r}",
+        f"domain={handle.domain_file_path!r}",
+    ]
+    if handle.filename:
+        selectors.append(f"filename={handle.filename!r}")
+    return "{" + ", ".join(selectors) + "}"
+
+
+def _ambiguous_target_message(selector: str, matches: list[ProgramHandle]) -> str:
+    choices = "; ".join(_target_selector_summary(h) for h in matches)
+    return (
+        f"selector {selector!r} matches {len(matches)} targets; "
+        f"use program_id, domain_file_path, or active. matches: {choices}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1197,12 +1216,13 @@ class GhxBridge:
             off = int(target_addrs[0].getOffset())
 
         code_refs: list[dict[str, Any]] = []
-        seen_from: set[int] = set()
+        seen_from: set[tuple[str, int]] = set()
         for addr in target_addrs:
             for ref in rm.getReferencesTo(addr):
                 from_addr = ref.getFromAddress()
                 from_off = int(from_addr.getOffset())
-                if from_off in seen_from:
+                from_key = (_address_space_name(from_addr), from_off)
+                if from_key in seen_from:
                     continue
                 caller = fm.getFunctionContaining(from_addr)
                 # Drop a matched thunk's own trampoline branch to its EXTERNAL
@@ -1210,12 +1230,13 @@ class GhxBridge:
                 if (matched_entries and caller is not None
                         and int(caller.getEntryPoint().getOffset()) in matched_entries):
                     continue
-                seen_from.add(from_off)
+                seen_from.add(from_key)
                 ref_type = ref.getReferenceType()
                 ins = listing.getInstructionAt(from_addr)
                 code_refs.append(
                     {
-                        "address": f"0x{from_off:x}",
+                        "address": _format_address(program, from_addr),
+                        "_sort_key": from_key,
                         "function": str(caller.getName()) if caller is not None else None,
                         "ref_type": str(ref_type),
                         "is_call": bool(ref_type.isCall()),
@@ -1224,22 +1245,28 @@ class GhxBridge:
                 )
 
         outgoing: list[dict[str, Any]] = []
-        seen_out: set[tuple[int, str]] = set()
+        seen_out: set[tuple[str, int, str]] = set()
         for addr in target_addrs:
             for ref in rm.getReferencesFrom(addr):
                 to = ref.getToAddress()
-                key = (int(to.getOffset()), str(ref.getReferenceType()))
+                key = (
+                    _address_space_name(to),
+                    int(to.getOffset()),
+                    str(ref.getReferenceType()),
+                )
                 if key in seen_out:
                     continue
                 seen_out.add(key)
                 outgoing.append(
                     {
-                        "address": f"0x{int(to.getOffset()):x}",
+                        "address": _format_address(program, to),
                         "ref_type": str(ref.getReferenceType()),
                     }
                 )
 
-        code_refs.sort(key=lambda r: int(r["address"], 16))
+        code_refs.sort(key=lambda r: r.get("_sort_key", ("", 0)))
+        for ref in code_refs:
+            ref.pop("_sort_key", None)
         incoming_total = len(code_refs)
         paged = code_refs[offset:]
         if limit is not None:
@@ -2341,12 +2368,15 @@ class GhxBridge:
         base = self._op_xrefs(params, target)
 
         for ref in base.get("incoming", []):
+            ref.setdefault("section", None)
             try:
                 off = int(ref["address"], 16)
             except (KeyError, ValueError, TypeError):
                 continue
             ref["section"] = _block_name_for(program, off)
         for ref in base.get("outgoing", []):
+            ref.setdefault("section", None)
+            ref.setdefault("symbol", None)
             try:
                 off = int(ref["address"], 16)
             except (KeyError, ValueError, TypeError):
@@ -3706,7 +3736,18 @@ class GhxBridge:
                     break
                 op_name = op_spec.get("op")
                 op_params = op_spec.get("params") or {}
+                if not isinstance(op_params, dict):
+                    failure_index = idx
+                    results.append(
+                        {
+                            "op": op_name,
+                            "status": "bad_request",
+                            "error": "op params must be dict",
+                        }
+                    )
+                    break
                 try:
+                    op_name, op_params = _normalize_batch_op(op_name, op_params)
                     # Re-dispatch inside the open transaction without starting
                     # a new one: call the relevant single-op helper directly.
                     single = self._run_single_inner(op_name, op_params, target)
@@ -3773,7 +3814,11 @@ class GhxBridge:
             return self._op_struct_field_delete(params, target)
         if op_name == "types_declare":
             return self._op_types_declare(params, target)
-        raise OperationFailure("bad_op", f"op not allowed in batch: {op_name!r}")
+        allowed = ", ".join(sorted(set(_BATCH_OP_ALIASES.values())))
+        raise OperationFailure(
+            "bad_op",
+            f"op not allowed in batch: {op_name!r}; allowed ops: {allowed}",
+        )
 
     # ---- py_exec --------------------------------------------------------
 
@@ -4015,6 +4060,103 @@ def _parse_address(program: Any, value: Any) -> int:
     if addr is None:
         raise OperationFailure("bad_address", f"could not parse address: {value!r}")
     return int(addr.getOffset())
+
+
+def _address_space_name(addr: Any) -> str:
+    try:
+        return str(addr.getAddressSpace().getName())
+    except Exception:
+        with contextlib.suppress(Exception):
+            return str(addr.getAddressSpace())
+    return "?"
+
+
+def _is_default_address_space(program: Any, addr: Any) -> bool:
+    try:
+        space = addr.getAddressSpace()
+        default = program.getAddressFactory().getDefaultAddressSpace()
+        if space == default:
+            return True
+        with contextlib.suppress(Exception):
+            if str(space.getName()) == str(default.getName()):
+                return True
+        return str(space) == str(default)
+    except Exception:
+        return False
+
+
+def _format_address(program: Any, addr: Any) -> str:
+    """Render a Ghidra Address without losing non-default address spaces."""
+    off = int(addr.getOffset())
+    if _is_default_address_space(program, addr):
+        return f"0x{off:x}"
+
+    rendered = str(addr)
+    if rendered and rendered not in ("None", f"{off:x}", f"{off:08x}"):
+        return rendered
+
+    return f"{_address_space_name(addr)}[{_signed_hex(off)}]"
+
+
+_BATCH_OP_ALIASES: dict[str, str] = {
+    "rename": "rename_symbol",
+    "symbol.rename": "rename_symbol",
+    "symbol_rename": "rename_symbol",
+    "symbol rename": "rename_symbol",
+    "comment.set": "set_comment",
+    "comment_set": "set_comment",
+    "comment set": "set_comment",
+    "comment.delete": "delete_comment",
+    "comment_delete": "delete_comment",
+    "comment delete": "delete_comment",
+    "proto.set": "set_prototype",
+    "proto_set": "set_prototype",
+    "proto set": "set_prototype",
+    "prototype.set": "set_prototype",
+    "types.declare": "types_declare",
+    "types_declare": "types_declare",
+    "types declare": "types_declare",
+    "local.rename": "local_rename",
+    "local_rename": "local_rename",
+    "local rename": "local_rename",
+    "local.retype": "local_retype",
+    "local_retype": "local_retype",
+    "local retype": "local_retype",
+    "struct.field.set": "struct_field_set",
+    "struct_field_set": "struct_field_set",
+    "struct field set": "struct_field_set",
+    "struct.field.rename": "struct_field_rename",
+    "struct_field_rename": "struct_field_rename",
+    "struct field rename": "struct_field_rename",
+    "struct.field.delete": "struct_field_delete",
+    "struct_field_delete": "struct_field_delete",
+    "struct field delete": "struct_field_delete",
+}
+
+_BATCH_PARAM_ALIASES: dict[str, dict[str, str]] = {
+    "set_comment": {"comment": "text"},
+    "set_prototype": {"function": "identifier"},
+    "local_rename": {"function": "identifier", "variable": "name"},
+    "local_retype": {"function": "identifier", "variable": "name", "new_type": "type"},
+    "struct_field_set": {"struct_name": "type_name"},
+    "struct_field_rename": {"struct_name": "type_name", "old_name": "name"},
+    "struct_field_delete": {"struct_name": "type_name", "field_name": "name"},
+}
+
+
+def _normalize_batch_op(
+    op_name: str | None, params: dict[str, Any]
+) -> tuple[str | None, dict[str, Any]]:
+    if op_name is None:
+        return None, params
+
+    key = str(op_name).strip()
+    canonical = _BATCH_OP_ALIASES.get(key, _BATCH_OP_ALIASES.get(key.lower(), key))
+    normalized = dict(params)
+    for source, dest in _BATCH_PARAM_ALIASES.get(canonical, {}).items():
+        if dest not in normalized and source in normalized:
+            normalized[dest] = normalized[source]
+    return canonical, normalized
 
 
 # Ghidra's synthetic memory block holding external-linkage trampolines — the
